@@ -101,42 +101,73 @@ def get_answer_value(answer):
             "").strip()
 
 
-def fetch_form_fields():
-    """Fetch form definition to discover contact info field IDs by title."""
+def discover_contact_fields(responses):
+    """Discover contact info field IDs from response data (no form definition needed)."""
     global CONTACT_FIELDS
 
-    url = f"https://api.typeform.com/forms/{TYPEFORM_FORM_ID}"
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TYPEFORM_TOKEN}"})
-    resp = urllib.request.urlopen(req)
-    form = json.loads(resp.read().decode())
+    known_ids = set(CAPABILITY_FIELDS.keys()) | {
+        FIELD_FIRST_NAME, FIELD_LAST_NAME, FIELD_EMAIL,
+        FIELD_RELATIONAL, FIELD_AUTONOMY,
+    }
 
-    def scan_fields(fields):
-        """Scan fields (handles top-level and nested group fields)."""
-        for field in fields:
-            title = field.get("title", "").lower()
-            fid = field.get("id", "")
+    # Collect unknown fields across first 10 responses for reliable discovery
+    unknown_fields = {}
+    for item in responses[:10]:
+        for answer in item.get("answers", []):
+            fid = answer.get("field", {}).get("id", "")
+            ftype = answer.get("field", {}).get("type", "")
+            atype = answer.get("type", "")
+            ref = answer.get("field", {}).get("ref", "")
+            if fid and fid not in known_ids:
+                value = get_answer_value(answer)
+                if fid not in unknown_fields:
+                    unknown_fields[fid] = {
+                        "field_type": ftype, "answer_type": atype,
+                        "ref": ref, "samples": [],
+                    }
+                if value:
+                    unknown_fields[fid]["samples"].append(value)
 
-            if "phone" in title:
-                CONTACT_FIELDS["phone"] = fid
-            elif "street address" in title:
-                CONTACT_FIELDS["street"] = fid
-            elif "address line 2" in title:
-                CONTACT_FIELDS["address_line_2"] = fid
-            elif title == "city" or ("city" in title and "state" not in title):
-                CONTACT_FIELDS["city"] = fid
-            elif "state" in title and "city" not in title:
-                CONTACT_FIELDS["state"] = fid
+    print(f"  Found {len(unknown_fields)} unknown fields to classify:")
+    for fid, info in unknown_fields.items():
+        sample = info["samples"][0][:50] if info["samples"] else "(empty)"
+        print(f"    {fid} type={info['answer_type']} ref={info['ref']} sample={sample}")
 
-            # Handle question groups
-            nested = field.get("properties", {}).get("fields", [])
-            if nested:
-                scan_fields(nested)
+    # Auto-classify by answer type and ref keywords
+    for fid, info in unknown_fields.items():
+        atype = info["answer_type"]
+        ref = info["ref"].lower()
 
-    scan_fields(form.get("fields", []))
-    print(f"Discovered contact fields: {list(CONTACT_FIELDS.keys())}")
-    for key, fid in CONTACT_FIELDS.items():
-        print(f"  {key}: {fid}")
-    time.sleep(0.35)
+        # Phone: distinct answer type
+        if atype == "phone_number":
+            CONTACT_FIELDS["phone"] = fid
+        # Address fields: check ref for keywords
+        elif "street" in ref or "address" in ref and "line" not in ref:
+            CONTACT_FIELDS["street"] = fid
+        elif "line_2" in ref or "line-2" in ref or "address_line" in ref or "address-line" in ref:
+            CONTACT_FIELDS["address_line_2"] = fid
+        elif ref == "city" or ("city" in ref and "state" not in ref):
+            CONTACT_FIELDS["city"] = fid
+        elif ref == "state" or ("state" in ref and "city" not in ref):
+            CONTACT_FIELDS["state"] = fid
+
+    # Fallback: if refs didn't help, try classifying by sample values
+    # Address-like: contains numbers + street words (St, Ave, Dr, Rd, etc.)
+    # City-like: 1-3 words, all letters, no numbers
+    if not CONTACT_FIELDS:
+        address_pattern = re.compile(r'\d+.*\b(st|ave|dr|rd|blvd|ln|ct|way|pl|cir)\b', re.IGNORECASE)
+        for fid, info in unknown_fields.items():
+            if fid in CONTACT_FIELDS.values():
+                continue
+            if info["answer_type"] != "text":
+                continue
+            for sample in info["samples"]:
+                if address_pattern.search(sample) and "street" not in CONTACT_FIELDS:
+                    CONTACT_FIELDS["street"] = fid
+                    break
+
+    print(f"  Classified contact fields: {CONTACT_FIELDS}")
+    return bool(CONTACT_FIELDS)
 
 
 def fetch_typeform_responses():
@@ -155,7 +186,9 @@ def fetch_typeform_responses():
         all_responses.extend(items)
         time.sleep(0.35)
 
-    print(f"Fetched {len(all_responses)} typeform responses (completed + partial)")
+    count = len(all_responses)
+    completed = sum(1 for r in all_responses if r.get("_completed"))
+    print(f"Fetched {count} typeform responses ({completed} completed, {count - completed} partial)")
     return all_responses
 
 
@@ -372,17 +405,13 @@ def update_notion(page_id, record, current_values):
 def main():
     print("=== Typeform V2 -> Notion Sync (Full) ===\n")
 
-    # Step 0: Discover contact info field IDs from form definition
-    print("[0] Discovering form fields...")
-    try:
-        fetch_form_fields()
-    except Exception as e:
-        print(f"  WARNING: Could not fetch form definition: {e}")
-        print("  Continuing with capability-only sync...\n")
-    print()
-
     # Step 1: Fetch all typeform responses
     responses = fetch_typeform_responses()
+
+    # Step 1b: Discover contact field IDs from response data
+    print("\n[1b] Discovering contact fields from response data...")
+    discover_contact_fields(responses)
+    print()
 
     # Step 2: Parse and match
     parsed = []
