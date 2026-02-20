@@ -220,6 +220,11 @@ def parse_response(item):
 
     # Need at least a name to match against Notion
     if not first_name and not last_name:
+        if not completed:
+            # Debug: show why partial response was skipped
+            field_ids = list(answer_map.keys())
+            print(f"  [debug] Partial response skipped (no name): {len(answers)} answers, "
+                  f"email={email or '(none)'}, fields={field_ids[:5]}")
         return None
 
     # Extract contact info (dynamically discovered fields)
@@ -276,6 +281,10 @@ def parse_response(item):
     # Accept any response with useful data (contact info OR capabilities)
     has_data = bool(cap_string or relational or autonomy or email or phone or address or city)
     if not has_data:
+        if not completed:
+            name = f"{first_name} {last_name}".strip()
+            print(f"  [debug] Partial '{name}' skipped (no data): email={email}, phone={phone}, "
+                  f"caps={bool(cap_string)}, addr={bool(address)}")
         return None
 
     return {
