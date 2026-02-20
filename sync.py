@@ -177,7 +177,15 @@ def fetch_typeform_responses():
     for completed_flag in ["true", "false"]:
         url = f"https://api.typeform.com/forms/{TYPEFORM_FORM_ID}/responses?page_size=100&completed={completed_flag}"
         req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TYPEFORM_TOKEN}"})
-        resp = urllib.request.urlopen(req)
+        try:
+            resp = urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            print(f"ERROR: Typeform API returned {e.code} for completed={completed_flag}")
+            if e.code == 403:
+                print("  Token may be expired or revoked. Regenerate at:")
+                print("  https://admin.typeform.com/user/tokens")
+                print("  Then update TYPEFORM_TOKEN in GitHub Secrets.")
+            raise
         data = json.loads(resp.read().decode())
 
         items = data.get("items", [])
