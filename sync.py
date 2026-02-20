@@ -49,8 +49,14 @@ FIELD_EMAIL = "wPikONTZh8zZ"
 FIELD_RELATIONAL = "GrQyr8j5sFPl"
 FIELD_AUTONOMY = "l7riGwpkiDZK"
 
-# Contact info field IDs — discovered dynamically from form definition
-CONTACT_FIELDS = {}  # populated by fetch_form_fields()
+# Contact info field IDs (verified from form gFojEmRj)
+CONTACT_FIELDS = {
+    "phone": "2ALk2W41peZh",
+    "street": "z4khG2SM40Kc",
+    "address_line_2": "u9FPkYqHQ1cy",
+    "city": "RhPRRCt4uxa4",
+    "state": "BndPdkJ1HDpQ",
+}
 
 # Relational preference mapping
 RELATIONAL_MAP = {
