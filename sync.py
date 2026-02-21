@@ -1,10 +1,12 @@
 """
 Typeform API -> Notion Sync
 Pulls all V2 responses via API, matches to Notion clients, updates records.
-Syncs BOTH capability assessments AND contact info (email, phone, address, city).
-Handles both backfill and new submissions.
+Syncs capability assessments, contact info, preferences, AND structured
+onboarding profile data into individual Notion properties for downstream
+agent consumption (job descriptions, trials, manual builds, endorsement packets).
 
 Can be run manually or as a cron job via GitHub Actions.
+Run with --verify to check data integrity across Notion client records.
 """
 import json
 import os
@@ -19,15 +21,21 @@ TYPEFORM_FORM_ID = os.environ.get("TYPEFORM_FORM_ID")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 NOTION_DB_ID = os.environ.get("NOTION_DB_ID")
 
-# Validate required env vars
-missing = []
-for var_name in ["TYPEFORM_TOKEN", "TYPEFORM_FORM_ID", "NOTION_TOKEN", "NOTION_DB_ID"]:
-    if not os.environ.get(var_name):
-        missing.append(var_name)
-
-if missing:
-    print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
-    sys.exit(1)
+# Validate required env vars (verify mode only needs Notion creds)
+VERIFY_MODE = "--verify" in sys.argv
+if not VERIFY_MODE:
+    missing = []
+    for var_name in ["TYPEFORM_TOKEN", "TYPEFORM_FORM_ID", "NOTION_TOKEN", "NOTION_DB_ID"]:
+        if not os.environ.get(var_name):
+            missing.append(var_name)
+    if missing:
+        print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
+        sys.exit(1)
+else:
+    if not NOTION_TOKEN or not NOTION_DB_ID:
+        missing = [v for v in ["NOTION_TOKEN", "NOTION_DB_ID"] if not os.environ.get(v)]
+        print(f"ERROR: Verify mode requires: {', '.join(missing)}")
+        sys.exit(1)
 
 # Typeform field IDs -> our capability short names
 CAPABILITY_FIELDS = {
@@ -74,6 +82,64 @@ AUTONOMY_MAP = {
     "between": "Somewhere in Between",
 }
 
+# Form field titles (populated at runtime from form definition)
+FORM_FIELD_TITLES = {}  # field_id -> question_title
+
+# === Structured Profile Routing ===
+# Maps keyword in question title -> (internal_key, sub_label)
+# internal_key determines which Notion property the answer goes to
+# sub_label is a prefix when multiple questions feed the same property
+PROFILE_ROUTING = [
+    ("household members", "household_members", None),
+    ("do you have pets", "pets", None),
+    ("type of pets", "pets", "Details"),
+    ("bedrooms and bathrooms", "home_size", None),
+    ("square footage", "home_size", "Sq Ft"),
+    ("pain points", "pain_points", None),
+    ("ideal start date", "ideal_start", None),
+    ("when would you ideally want", "preferred_hours", None),
+    ("don't want support", "off_limits_times", None),
+    ("special household considerations", "special_considerations", None),
+    ("typical weekday", "routines", "Weekday"),
+    ("typical weekend", "routines", "Weekend"),
+    ("work schedules", "routines", "Work"),
+    ("school schedule", "kids_activities", "School"),
+    ("after-school", "kids_activities", "Activities"),
+    # Lower-frequency fields -> household_notes catch-all
+    ("household support", "household_notes", "Current Support"),
+    ("describe your current support", "household_notes", "Support Details"),
+    ("keep this support or transition", "household_notes", "Keep/Transition"),
+    ("moving soon", "household_notes", "Moving"),
+    ("upcoming travel", "household_notes", "Travel"),
+    ("trash", "household_notes", "Trash/Recycling"),
+    ("routine vendors", "household_notes", "Vendors"),
+    ("shows up in your home", "household_notes", "Style"),
+    ("fitness or wellness", "household_notes", "Wellness"),
+    ("chaotic", "household_notes", "Chaotic Areas"),
+    ("recurring friction", "household_notes", "Friction"),
+    ("restored and relaxed", "household_notes", "Restoration"),
+    ("anything else", "household_notes", "Other"),
+]
+
+# Internal key -> Notion property name
+PROFILE_NOTION_PROPERTIES = {
+    "household_members": "Household Members",
+    "pets": "Pets",
+    "home_size": "Home Size",
+    "pain_points": "Pain Points",
+    "ideal_start": "Ideal Start",
+    "preferred_hours": "Preferred Hours",
+    "off_limits_times": "Off-Limits Times",
+    "special_considerations": "Special Considerations",
+    "routines": "Routines",
+    "kids_activities": "Kids & Activities",
+    "household_notes": "Household Notes",
+}
+
+
+# ============================================================================
+# Helper functions
+# ============================================================================
 
 def extract_level(label):
     """Extract level number from choice label like 'Level 2: Full Household...'"""
@@ -105,6 +171,99 @@ def get_answer_value(answer):
             answer.get("email", "") or
             answer.get("phone_number", "") or
             "").strip()
+
+
+def extract_answer_text(answer):
+    """Extract displayable text from any Typeform answer type (for profile building)."""
+    atype = answer.get("type", "")
+    if atype == "text":
+        return answer.get("text", "").strip()
+    elif atype == "email":
+        return answer.get("email", "").strip()
+    elif atype == "phone_number":
+        return answer.get("phone_number", "").strip()
+    elif atype == "choice":
+        return answer.get("choice", {}).get("label", "").strip()
+    elif atype == "choices":
+        labels = answer.get("choices", {}).get("labels", [])
+        return ", ".join(l for l in labels if l)
+    elif atype == "number":
+        num = answer.get("number")
+        if num is None:
+            return ""
+        return str(int(num)) if num == int(num) else str(num)
+    elif atype == "boolean":
+        return "Yes" if answer.get("boolean") else "No"
+    elif atype == "date":
+        return answer.get("date", "").strip()
+    elif atype == "url":
+        return answer.get("url", "").strip()
+    elif atype == "file_url":
+        return answer.get("file_url", "").strip()
+    return ""
+
+
+def route_answer_to_profile(title):
+    """Route a Typeform question to the correct profile property via keyword matching.
+    Returns (internal_key, sub_label) or (None, None) if no match."""
+    if not title:
+        return None, None
+    lower = title.lower()
+    for keyword, internal_key, sub_label in PROFILE_ROUTING:
+        if keyword in lower:
+            return internal_key, sub_label
+    return None, None
+
+
+# ============================================================================
+# Typeform API functions
+# ============================================================================
+
+def fetch_form_definition():
+    """Fetch the Typeform form definition to get field IDs and question titles."""
+    global FORM_FIELD_TITLES
+    url = f"https://api.typeform.com/forms/{TYPEFORM_FORM_ID}"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TYPEFORM_TOKEN}"})
+    resp = urllib.request.urlopen(req)
+    form = json.loads(resp.read().decode())
+
+    for field in form.get("fields", []):
+        FORM_FIELD_TITLES[field["id"]] = field.get("title", "")
+        # Handle nested fields inside groups
+        for sub in field.get("properties", {}).get("fields", []):
+            FORM_FIELD_TITLES[sub["id"]] = sub.get("title", "")
+
+    print(f"  Loaded {len(FORM_FIELD_TITLES)} field titles from form definition")
+
+
+def fetch_typeform_responses():
+    """Fetch all V2 typeform responses via API (both completed and partial)."""
+    all_responses = []
+
+    for completed_flag in ["true", "false"]:
+        url = f"https://api.typeform.com/forms/{TYPEFORM_FORM_ID}/responses?page_size=100&completed={completed_flag}"
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TYPEFORM_TOKEN}"})
+        try:
+            resp = urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            print(f"ERROR: Typeform API returned {e.code} for completed={completed_flag}")
+            if e.code == 403:
+                print("  Token may be expired or revoked. Regenerate at:")
+                print("  https://admin.typeform.com/user/tokens")
+                print("  Then update TYPEFORM_TOKEN in GitHub Secrets.")
+            raise
+        data = json.loads(resp.read().decode())
+
+        items = data.get("items", [])
+        for item in items:
+            item["_completed"] = (completed_flag == "true")
+        all_responses.extend(items)
+        time.sleep(0.35)
+
+    count = len(all_responses)
+    completed = sum(1 for r in all_responses if r.get("_completed"))
+    print(f"Fetched {count} typeform responses ({completed} completed, {count - completed} partial)")
+    return all_responses
 
 
 def discover_contact_fields(responses):
@@ -158,8 +317,6 @@ def discover_contact_fields(responses):
             CONTACT_FIELDS["state"] = fid
 
     # Fallback: if refs didn't help, try classifying by sample values
-    # Address-like: contains numbers + street words (St, Ave, Dr, Rd, etc.)
-    # City-like: 1-3 words, all letters, no numbers
     if not CONTACT_FIELDS:
         address_pattern = re.compile(r'\d+.*\b(st|ave|dr|rd|blvd|ln|ct|way|pl|cir)\b', re.IGNORECASE)
         for fid, info in unknown_fields.items():
@@ -176,35 +333,179 @@ def discover_contact_fields(responses):
     return bool(CONTACT_FIELDS)
 
 
-def fetch_typeform_responses():
-    """Fetch all V2 typeform responses via API (both completed and partial)."""
-    all_responses = []
+# ============================================================================
+# Notion API functions
+# ============================================================================
 
-    for completed_flag in ["true", "false"]:
-        url = f"https://api.typeform.com/forms/{TYPEFORM_FORM_ID}/responses?page_size=100&completed={completed_flag}"
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TYPEFORM_TOKEN}"})
+def ensure_profile_properties():
+    """Create all structured profile properties in Notion DB if they don't exist."""
+    req = urllib.request.Request(
+        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}",
+        headers={
+            "Authorization": f"Bearer {NOTION_TOKEN}",
+            "Notion-Version": "2022-06-28",
+        }
+    )
+    resp = urllib.request.urlopen(req)
+    db = json.loads(resp.read().decode())
+
+    existing = set(db.get("properties", {}).keys())
+    to_create = {}
+
+    for notion_prop in PROFILE_NOTION_PROPERTIES.values():
+        if notion_prop not in existing:
+            to_create[notion_prop] = {"rich_text": {}}
+
+    if not to_create:
+        print(f"  All {len(PROFILE_NOTION_PROPERTIES)} profile properties exist")
+        return True
+
+    print(f"  Creating {len(to_create)} properties: {', '.join(to_create.keys())}")
+    body = json.dumps({"properties": to_create}).encode()
+    req = urllib.request.Request(
+        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}",
+        data=body, method="PATCH",
+        headers={
+            "Authorization": f"Bearer {NOTION_TOKEN}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json"
+        }
+    )
+    urllib.request.urlopen(req)
+    print("  Created!")
+    return True
+
+
+def find_notion_client(last_name, first_name):
+    """Search Notion for a client record by name. Returns page_id, name, and current values."""
+    # Try last name first (more unique)
+    for search_term in [last_name, first_name]:
+        if not search_term:
+            continue
+
+        body = json.dumps({
+            "filter": {"property": "Task name", "title": {"contains": search_term}},
+            "page_size": 3
+        }).encode()
+
+        req = urllib.request.Request(
+            f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
+            data=body, method="POST",
+            headers={
+                "Authorization": f"Bearer {NOTION_TOKEN}",
+                "Notion-Version": "2022-06-28",
+                "Content-Type": "application/json"
+            }
+        )
+
         try:
             resp = urllib.request.urlopen(req)
-        except urllib.error.HTTPError as e:
-            print(f"ERROR: Typeform API returned {e.code} for completed={completed_flag}")
-            if e.code == 403:
-                print("  Token may be expired or revoked. Regenerate at:")
-                print("  https://admin.typeform.com/user/tokens")
-                print("  Then update TYPEFORM_TOKEN in GitHub Secrets.")
-            raise
-        data = json.loads(resp.read().decode())
+            data = json.loads(resp.read().decode())
+            results = data.get("results", [])
+            if results:
+                page = results[0]
+                props = page.get("properties", {})
+                title_parts = props.get("Task name", {}).get("title", [])
+                notion_name = "".join([t.get("plain_text", "") for t in title_parts])
 
-        items = data.get("items", [])
-        for item in items:
-            item["_completed"] = (completed_flag == "true")
-        all_responses.extend(items)
+                # Extract current field values to avoid overwriting
+                current = {
+                    "email": props.get("Email", {}).get("email", "") or "",
+                    "phone": props.get("Phone", {}).get("phone_number", "") or "",
+                    "address": "".join(
+                        t.get("plain_text", "")
+                        for t in props.get("Client Address", {}).get("rich_text", [])
+                    ).strip(),
+                    "city": "".join(
+                        t.get("plain_text", "")
+                        for t in props.get("City", {}).get("rich_text", [])
+                    ).strip(),
+                    "state": (props.get("State", {}).get("select") or {}).get("name", ""),
+                }
+
+                # Read all profile properties
+                for internal_key, notion_prop in PROFILE_NOTION_PROPERTIES.items():
+                    rt = props.get(notion_prop, {}).get("rich_text", [])
+                    current[internal_key] = "".join(
+                        t.get("plain_text", "") for t in rt
+                    ).strip()
+
+                return page["id"], notion_name, current
+        except Exception as e:
+            print(f"  Search error for '{search_term}': {e}")
+
         time.sleep(0.35)
 
-    count = len(all_responses)
-    completed = sum(1 for r in all_responses if r.get("_completed"))
-    print(f"Fetched {count} typeform responses ({completed} completed, {count - completed} partial)")
-    return all_responses
+    return None, None, {}
 
+
+def update_notion(page_id, record, current_values):
+    """Update Notion client record with typeform data."""
+    properties = {}
+
+    # Contact info — only fill if currently empty in Notion
+    if record["email"] and not current_values.get("email"):
+        properties["Email"] = {"email": record["email"]}
+    if record["phone"] and not current_values.get("phone"):
+        properties["Phone"] = {"phone_number": record["phone"]}
+    if record["address"] and not current_values.get("address"):
+        properties["Client Address"] = {
+            "rich_text": [{"text": {"content": record["address"][:2000]}}]
+        }
+    if record["city"] and not current_values.get("city"):
+        properties["City"] = {
+            "rich_text": [{"text": {"content": record["city"]}}]
+        }
+    if record["state"] and not current_values.get("state"):
+        properties["State"] = {"select": {"name": record["state"]}}
+
+    # Capabilities — always overwrite (latest assessment wins)
+    if record["capabilities"]:
+        properties["Capability Requirements"] = {
+            "rich_text": [{"text": {"content": record["capabilities"]}}]
+        }
+    if record["relational"]:
+        properties["Relational Preference"] = {"select": {"name": record["relational"]}}
+    if record["autonomy"]:
+        properties["Decision Autonomy"] = {"select": {"name": record["autonomy"]}}
+
+    # Profile fields — only fill if currently empty (preserves manual edits)
+    for internal_key, notion_prop in PROFILE_NOTION_PROPERTIES.items():
+        value = record.get("profile_fields", {}).get(internal_key, "")
+        if value and not current_values.get(internal_key):
+            properties[notion_prop] = {
+                "rich_text": [{"text": {"content": value[:2000]}}]
+            }
+
+    # Always write Typeform Status so team knows full vs partial
+    status = "Complete" if record["completed"] else "Partial"
+    properties["Typeform Status"] = {"select": {"name": status}}
+
+    if len(properties) <= 1:
+        # Only has status, no actual data — skip
+        return False, []
+
+    # Track what we're writing for logging
+    written_fields = [k for k in properties if k != "Typeform Status"]
+
+    body = json.dumps({"properties": properties}).encode()
+    req = urllib.request.Request(
+        f"https://api.notion.com/v1/pages/{page_id}",
+        data=body, method="PATCH",
+        headers={
+            "Authorization": f"Bearer {NOTION_TOKEN}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json"
+        }
+    )
+
+    resp = urllib.request.urlopen(req)
+    return resp.status == 200, written_fields
+
+
+# ============================================================================
+# Response parsing
+# ============================================================================
 
 def parse_response(item):
     """Parse a single typeform response into structured data."""
@@ -227,7 +528,6 @@ def parse_response(item):
     # Need at least a name to match against Notion
     if not first_name and not last_name:
         if not completed:
-            # Debug: show why partial response was skipped
             field_ids = list(answer_map.keys())
             print(f"  [debug] Partial response skipped (no name): {len(answers)} answers, "
                   f"email={email or '(none)'}, fields={field_ids[:5]}")
@@ -284,8 +584,51 @@ def parse_response(item):
     aut_label = answer_map.get(FIELD_AUTONOMY, {}).get("choice", {}).get("label", "")
     autonomy = map_select(aut_label, AUTONOMY_MAP)
 
-    # Accept any response with useful data (contact info OR capabilities)
-    has_data = bool(cap_string or relational or autonomy or email or phone or address or city)
+    # Build structured profile fields from remaining answers
+    known_ids = set(CAPABILITY_FIELDS.keys()) | {
+        FIELD_FIRST_NAME, FIELD_LAST_NAME, FIELD_EMAIL,
+        FIELD_RELATIONAL, FIELD_AUTONOMY,
+    } | set(CONTACT_FIELDS.values())
+
+    profile_data = {}  # internal_key -> list of (sub_label, value)
+
+    for a in answers:
+        fid = a.get("field", {}).get("id", "")
+        if fid in known_ids or not fid:
+            continue
+
+        value = extract_answer_text(a)
+        if not value or value.lower() in ("n/a", "none", "0", "", "i don't have any pets."):
+            continue
+
+        # Route to the correct profile property
+        title = FORM_FIELD_TITLES.get(fid, "")
+        internal_key, sub_label = route_answer_to_profile(title)
+
+        if internal_key:
+            if internal_key not in profile_data:
+                profile_data[internal_key] = []
+            profile_data[internal_key].append((sub_label, value))
+        elif title and value:
+            # Unrecognized field -> household_notes catch-all
+            if "household_notes" not in profile_data:
+                profile_data["household_notes"] = []
+            clean = title.rstrip("?").strip()[:50]
+            profile_data["household_notes"].append((clean, value))
+
+    # Compile each profile bucket into a string
+    profile_fields = {}
+    for internal_key, entries in profile_data.items():
+        parts = []
+        for sub_label, value in entries:
+            if sub_label:
+                parts.append(f"{sub_label}: {value}")
+            else:
+                parts.append(value)
+        profile_fields[internal_key] = "\n".join(parts)
+
+    has_profile = any(profile_fields.values())
+    has_data = bool(cap_string or relational or autonomy or email or phone or address or city or has_profile)
     if not has_data:
         if not completed:
             name = f"{first_name} {last_name}".strip()
@@ -305,128 +648,262 @@ def parse_response(item):
         "capabilities": cap_string,
         "relational": relational,
         "autonomy": autonomy,
+        "profile_fields": profile_fields,
         "submitted": submitted[:10] if submitted else "",
         "response_id": response_id,
         "completed": completed,
     }
 
 
-def find_notion_client(last_name, first_name):
-    """Search Notion for a client record by name. Returns page_id, name, and current values."""
-    # Try last name first (more unique)
-    for search_term in [last_name, first_name]:
-        if not search_term:
-            continue
+# ============================================================================
+# Data integrity verification
+# ============================================================================
 
-        body = json.dumps({
-            "filter": {"property": "Task name", "title": {"contains": search_term}},
-            "page_size": 3
-        }).encode()
-
+def fetch_all_notion_clients():
+    """Fetch all client records from Notion with all field values."""
+    all_results = []
+    cursor = None
+    while True:
+        body = {"page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        data_body = json.dumps(body).encode()
         req = urllib.request.Request(
             f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
-            data=body, method="POST",
+            data=data_body, method="POST",
             headers={
                 "Authorization": f"Bearer {NOTION_TOKEN}",
                 "Notion-Version": "2022-06-28",
                 "Content-Type": "application/json"
             }
         )
-
-        try:
-            resp = urllib.request.urlopen(req)
-            data = json.loads(resp.read().decode())
-            results = data.get("results", [])
-            if results:
-                page = results[0]
-                props = page.get("properties", {})
-                title_parts = props.get("Task name", {}).get("title", [])
-                notion_name = "".join([t.get("plain_text", "") for t in title_parts])
-
-                # Extract current field values to avoid overwriting
-                current = {
-                    "email": props.get("Email", {}).get("email", "") or "",
-                    "phone": props.get("Phone", {}).get("phone_number", "") or "",
-                    "address": "".join(
-                        t.get("plain_text", "")
-                        for t in props.get("Client Address", {}).get("rich_text", [])
-                    ).strip(),
-                    "city": "".join(
-                        t.get("plain_text", "")
-                        for t in props.get("City", {}).get("rich_text", [])
-                    ).strip(),
-                    "state": (props.get("State", {}).get("select") or {}).get("name", ""),
-                }
-
-                return page["id"], notion_name, current
-        except Exception as e:
-            print(f"  Search error for '{search_term}': {e}")
-
+        resp = urllib.request.urlopen(req)
+        data = json.loads(resp.read().decode())
+        all_results.extend(data.get("results", []))
+        if data.get("has_more"):
+            cursor = data["next_cursor"]
+        else:
+            break
         time.sleep(0.35)
-
-    return None, None, {}
-
-
-def update_notion(page_id, record, current_values):
-    """Update Notion client record with typeform data. Only fills empty fields for contact info."""
-    properties = {}
-
-    # Contact info — only fill if currently empty in Notion
-    if record["email"] and not current_values.get("email"):
-        properties["Email"] = {"email": record["email"]}
-    if record["phone"] and not current_values.get("phone"):
-        properties["Phone"] = {"phone_number": record["phone"]}
-    if record["address"] and not current_values.get("address"):
-        properties["Client Address"] = {
-            "rich_text": [{"text": {"content": record["address"][:2000]}}]
-        }
-    if record["city"] and not current_values.get("city"):
-        properties["City"] = {
-            "rich_text": [{"text": {"content": record["city"]}}]
-        }
-    if record["state"] and not current_values.get("state"):
-        properties["State"] = {"select": {"name": record["state"]}}
-
-    # Capabilities — always overwrite (latest assessment wins)
-    if record["capabilities"]:
-        properties["Capability Requirements"] = {
-            "rich_text": [{"text": {"content": record["capabilities"]}}]
-        }
-    if record["relational"]:
-        properties["Relational Preference"] = {"select": {"name": record["relational"]}}
-    if record["autonomy"]:
-        properties["Decision Autonomy"] = {"select": {"name": record["autonomy"]}}
-
-    # Always write Typeform Status so team knows full vs partial
-    status = "Complete" if record["completed"] else "Partial"
-    properties["Typeform Status"] = {"select": {"name": status}}
-
-    if len(properties) <= 1:
-        # Only has status, no actual data — skip
-        return False, []
-
-    # Track what we're writing for logging
-    written_fields = [k for k in properties if k != "Typeform Status"]
-
-    body = json.dumps({"properties": properties}).encode()
-    req = urllib.request.Request(
-        f"https://api.notion.com/v1/pages/{page_id}",
-        data=body, method="PATCH",
-        headers={
-            "Authorization": f"Bearer {NOTION_TOKEN}",
-            "Notion-Version": "2022-06-28",
-            "Content-Type": "application/json"
-        }
-    )
-
-    resp = urllib.request.urlopen(req)
-    return resp.status == 200, written_fields
+    return all_results
 
 
-# === Main ===
+def verify_data():
+    """Check data integrity across all Notion client records."""
+    print("=== Data Integrity Check ===\n")
+
+    # Step 1: Fetch all clients
+    print("[1] Fetching all Notion clients...")
+    all_results = fetch_all_notion_clients()
+    print(f"  Found {len(all_results)} total client records\n")
+
+    # Define all tracked fields
+    core_fields = [
+        ("Email", "email"),
+        ("Phone", "phone_number"),
+        ("Client Address", "rich_text"),
+        ("City", "rich_text"),
+        ("State", "select"),
+        ("Capability Requirements", "rich_text"),
+        ("Relational Preference", "select"),
+        ("Decision Autonomy", "select"),
+    ]
+
+    profile_fields = [(prop, "rich_text") for prop in PROFILE_NOTION_PROPERTIES.values()]
+
+    all_fields = core_fields + profile_fields + [("Typeform Status", "select")]
+
+    # Step 2: Analyze each client
+    field_stats = {f[0]: {"filled": 0, "empty": 0, "truncated": 0} for f in all_fields}
+    complete_clients = []
+    partial_clients = []
+    no_form_clients = []
+    issues = []
+
+    for page in all_results:
+        props = page.get("properties", {})
+        title_parts = props.get("Task name", {}).get("title", [])
+        name = "".join(t.get("plain_text", "") for t in title_parts).strip()
+
+        tf_status = (props.get("Typeform Status", {}).get("select") or {}).get("name", "")
+
+        if tf_status == "Complete":
+            complete_clients.append(name)
+        elif tf_status == "Partial":
+            partial_clients.append(name)
+        else:
+            no_form_clients.append(name)
+
+        for field_name, field_type in all_fields:
+            prop = props.get(field_name, {})
+            value = ""
+
+            if field_type == "email":
+                value = prop.get("email", "") or ""
+            elif field_type == "phone_number":
+                value = prop.get("phone_number", "") or ""
+            elif field_type == "rich_text":
+                rt = prop.get("rich_text", [])
+                value = "".join(t.get("plain_text", "") for t in rt).strip()
+            elif field_type == "select":
+                value = (prop.get("select") or {}).get("name", "")
+
+            if value:
+                field_stats[field_name]["filled"] += 1
+                if len(value) >= 1990:
+                    field_stats[field_name]["truncated"] += 1
+            else:
+                field_stats[field_name]["empty"] += 1
+
+        # Check complete-form clients for missing critical fields
+        if tf_status == "Complete":
+            critical = ["Capability Requirements", "Relational Preference", "Decision Autonomy"]
+            missing_critical = []
+            for cf in critical:
+                prop = props.get(cf, {})
+                if cf in ("Relational Preference", "Decision Autonomy"):
+                    val = (prop.get("select") or {}).get("name", "")
+                else:
+                    val = "".join(t.get("plain_text", "") for t in prop.get("rich_text", [])).strip()
+                if not val:
+                    missing_critical.append(cf)
+            if missing_critical:
+                issues.append((name, missing_critical))
+
+    total = len(all_results)
+
+    # Step 3: Report
+    print(f"[2] Typeform Status Distribution:")
+    print(f"  Complete:  {len(complete_clients)}")
+    print(f"  Partial:   {len(partial_clients)}")
+    print(f"  No form:   {len(no_form_clients)}")
+    print()
+
+    print(f"[3] Field Fill Rates (across {total} clients):")
+    print(f"  {'Field':<28} {'Filled':>7} {'Empty':>7} {'Rate':>6} {'Trunc':>6}")
+    print(f"  {'-' * 56}")
+
+    for field_name, _ in all_fields:
+        stats = field_stats[field_name]
+        filled = stats["filled"]
+        empty = stats["empty"]
+        rate = (filled / total * 100) if total > 0 else 0
+        trunc = stats["truncated"]
+
+        flags = ""
+        if trunc > 0:
+            flags += " [TRUNCATED]"
+
+        print(f"  {field_name:<28} {filled:>7} {empty:>7} {rate:>5.0f}% {trunc:>5}{flags}")
+
+    # Step 4: Critical field integrity
+    print(f"\n[4] Critical Field Integrity (Complete-form clients):")
+    if not issues:
+        print(f"  All {len(complete_clients)} complete-form clients have critical fields populated")
+    else:
+        for name, missing_fields in issues:
+            print(f"  MISSING  {name}: {', '.join(missing_fields)}")
+        print(f"\n  {len(issues)} of {len(complete_clients)} complete-form clients have gaps")
+
+    # Step 5: Capability format check
+    print(f"\n[5] Capability Format Consistency:")
+    valid_pattern = re.compile(r'^([A-Za-z &]+: (L[1-4]|N/A)(, )?)+$')
+    bad_caps = 0
+    for page in all_results:
+        props = page.get("properties", {})
+        cap_rt = props.get("Capability Requirements", {}).get("rich_text", [])
+        cap_val = "".join(t.get("plain_text", "") for t in cap_rt).strip()
+        if cap_val and not valid_pattern.match(cap_val):
+            title_parts = props.get("Task name", {}).get("title", [])
+            name = "".join(t.get("plain_text", "") for t in title_parts).strip()
+            print(f"  NON-STANDARD  {name}: {cap_val[:60]}...")
+            bad_caps += 1
+
+    if bad_caps == 0:
+        print(f"  All capability strings use standard L1-L4/N/A format")
+
+    # Step 6: Profile completeness for complete-form clients
+    print(f"\n[6] Profile Completeness (Complete-form clients):")
+    high_value_keys = ["household_members", "pets", "home_size", "pain_points",
+                       "preferred_hours", "special_considerations", "routines"]
+    high_value_props = [PROFILE_NOTION_PROPERTIES[k] for k in high_value_keys]
+
+    profile_scores = []
+    for page in all_results:
+        props = page.get("properties", {})
+        tf_status = (props.get("Typeform Status", {}).get("select") or {}).get("name", "")
+        if tf_status != "Complete":
+            continue
+
+        filled_count = 0
+        for prop_name in high_value_props:
+            rt = props.get(prop_name, {}).get("rich_text", [])
+            val = "".join(t.get("plain_text", "") for t in rt).strip()
+            if val:
+                filled_count += 1
+
+        score = (filled_count / len(high_value_props)) * 100
+        title_parts = props.get("Task name", {}).get("title", [])
+        name = "".join(t.get("plain_text", "") for t in title_parts).strip()
+        profile_scores.append((name, score, filled_count))
+
+    if profile_scores:
+        avg_score = sum(s[1] for s in profile_scores) / len(profile_scores)
+        full_profiles = sum(1 for s in profile_scores if s[1] == 100)
+        empty_profiles = sum(1 for s in profile_scores if s[1] == 0)
+
+        print(f"  Average profile completeness: {avg_score:.0f}%")
+        print(f"  Fully populated: {full_profiles}/{len(profile_scores)}")
+        print(f"  Empty profiles:  {empty_profiles}/{len(profile_scores)}")
+
+        # Show clients with incomplete profiles
+        incomplete = [(n, s, c) for n, s, c in profile_scores if 0 < s < 100]
+        if incomplete:
+            print(f"\n  Partially complete profiles:")
+            for name, score, count in sorted(incomplete, key=lambda x: x[1]):
+                print(f"    {name}: {score:.0f}% ({count}/{len(high_value_props)} high-value fields)")
+
+        if empty_profiles > 0:
+            print(f"\n  Clients with zero profile data (may need re-sync):")
+            for name, score, _ in profile_scores:
+                if score == 0:
+                    print(f"    {name}")
+    else:
+        print(f"  No complete-form clients found")
+
+    print(f"\n{'=' * 60}")
+    print(f"  SUMMARY: {total} clients, {len(complete_clients)} with complete forms")
+    if profile_scores:
+        avg = sum(s[1] for s in profile_scores) / len(profile_scores)
+        print(f"  Profile data health: {avg:.0f}% average completeness")
+    print(f"  Critical field issues: {len(issues)}")
+    print(f"{'=' * 60}")
+
+
+# ============================================================================
+# Main sync
+# ============================================================================
 
 def main():
-    print("=== Typeform V2 -> Notion Sync (Full) ===\n")
+    print("=== Typeform V2 -> Notion Sync (Structured) ===\n")
+
+    # Step 0: Fetch form definition for profile field routing
+    print("[0] Fetching form definition for profile field mapping...")
+    try:
+        fetch_form_definition()
+    except Exception as e:
+        print(f"  WARNING: Could not fetch form definition: {e}")
+        print("  Profile fields will route to catch-all")
+    print()
+
+    # Step 0b: Ensure all profile properties exist in Notion
+    print("[0b] Checking Notion profile properties...")
+    try:
+        ensure_profile_properties()
+    except Exception as e:
+        print(f"  WARNING: Could not check/create properties: {e}")
+        print("  Profile data may fail to write if properties don't exist")
+    print()
 
     # Step 1: Fetch all typeform responses
     responses = fetch_typeform_responses()
@@ -454,10 +931,8 @@ def main():
         if not existing:
             by_key[key] = r
         elif r["completed"] and not existing["completed"]:
-            # Completed submission beats partial
             by_key[key] = r
         elif r["completed"] == existing["completed"] and r["submitted"] > existing["submitted"]:
-            # Same type — keep latest
             by_key[key] = r
 
     records = list(by_key.values())
@@ -495,6 +970,12 @@ def main():
         if contact_parts:
             print(f"  Contact: {', '.join(contact_parts)}")
 
+        # Show profile fields in logs
+        pf = r.get("profile_fields", {})
+        if pf:
+            filled = [PROFILE_NOTION_PROPERTIES.get(k, k) for k in pf if pf[k]]
+            print(f"  Profile: {len(filled)} fields ({', '.join(filled[:4])}{'...' if len(filled) > 4 else ''})")
+
         page_id, notion_name, current = find_notion_client(r["last"], r["first"])
         time.sleep(0.35)
 
@@ -531,4 +1012,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    if VERIFY_MODE:
+        verify_data()
+    else:
+        main()
