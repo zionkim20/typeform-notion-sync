@@ -50,32 +50,35 @@ jobs:
         run: python sync.py --verify
 
       - name: Notify Slack on failure
-        if: failure() && secrets.SLACK_WEBHOOK_URL != ''
+        if: failure()
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ secrets.SLACK_ZION_DM_CHANNEL }}
         run: |
           SUMMARY=$(tail -5 sync_output.txt 2>/dev/null || echo "No output captured")
-          curl -s -X POST "$SLACK_WEBHOOK_URL" \
-            -H 'Content-Type: application/json' \
-            -d "$(python3 -c "
-          import json, sys
-          print(json.dumps({
-              'text': ':rotating_light: *Typeform → Notion Sync FAILED*\n\`\`\`' + sys.argv[1][:500] + '\`\`\`\n<https://github.com/zionkim20/typeform-notion-sync/actions|View Logs>',
-              'unfurl_links': False
-          }))
-          " "$SUMMARY")"
+          python3 -c "
+          import json, urllib.request, sys, os
+          body = json.dumps({
+              'channel': os.environ['SLACK_CHANNEL'],
+              'text': ':rotating_light: *Typeform → Notion Sync FAILED*\n\`\`\`' + sys.argv[1][:500] + '\`\`\`\n<https://github.com/zionkim20/typeform-notion-sync/actions|View Logs>'
+          }).encode()
+          req = urllib.request.Request('https://slack.com/api/chat.postMessage',
+              data=body, method='POST',
+              headers={'Authorization': 'Bearer ' + os.environ['SLACK_BOT_TOKEN'], 'Content-Type': 'application/json'})
+          urllib.request.urlopen(req)
+          " "$SUMMARY"
 
       - name: Notify Slack on data issues
-        if: success() && secrets.SLACK_WEBHOOK_URL != ''
+        if: success()
         env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ secrets.SLACK_ZION_DM_CHANNEL }}
         run: |
           # Only notify if there were updates, warnings, or not-found clients
-          if grep -qE "(UPDATED|NOT FOUND|WARNING|MATCH WARNING)" sync_output.txt 2>/dev/null; then
+          if grep -qE "(UPDATED|NOT FOUND|MATCH WARNING)" sync_output.txt 2>/dev/null; then
             UPDATED=$(grep -c "UPDATED" sync_output.txt 2>/dev/null || echo 0)
             NOT_FOUND=$(grep -c "NOT FOUND" sync_output.txt 2>/dev/null || echo 0)
             WARNINGS=$(grep -c "MATCH WARNING" sync_output.txt 2>/dev/null || echo 0)
-            SUMMARY=$(tail -5 sync_output.txt 2>/dev/null || echo "")
 
             if [ "$WARNINGS" -gt 0 ] || [ "$NOT_FOUND" -gt 0 ]; then
               EMOJI=":warning:"
@@ -85,13 +88,15 @@ jobs:
               LABEL="Sync completed"
             fi
 
-            curl -s -X POST "$SLACK_WEBHOOK_URL" \
-              -H 'Content-Type: application/json' \
-              -d "$(python3 -c "
-          import json, sys
-          print(json.dumps({
-              'text': sys.argv[1] + ' *' + sys.argv[2] + '*\nUpdated: ' + sys.argv[3] + ' | Not found: ' + sys.argv[4] + ' | Match warnings: ' + sys.argv[5] + '\n<https://github.com/zionkim20/typeform-notion-sync/actions|View Details>',
-              'unfurl_links': False
-          }))
-          " "$EMOJI" "$LABEL" "$UPDATED" "$NOT_FOUND" "$WARNINGS")"
+            python3 -c "
+          import json, urllib.request, sys, os
+          body = json.dumps({
+              'channel': os.environ['SLACK_CHANNEL'],
+              'text': sys.argv[1] + ' *' + sys.argv[2] + '*\nUpdated: ' + sys.argv[3] + ' | Not found: ' + sys.argv[4] + ' | Match warnings: ' + sys.argv[5] + '\n<https://github.com/zionkim20/typeform-notion-sync/actions|View Details>'
+          }).encode()
+          req = urllib.request.Request('https://slack.com/api/chat.postMessage',
+              data=body, method='POST',
+              headers={'Authorization': 'Bearer ' + os.environ['SLACK_BOT_TOKEN'], 'Content-Type': 'application/json'})
+          urllib.request.urlopen(req)
+          " "$EMOJI" "$LABEL" "$UPDATED" "$NOT_FOUND" "$WARNINGS"
           fi
