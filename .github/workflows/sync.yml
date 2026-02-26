@@ -29,13 +29,18 @@ jobs:
           python-version: '3.12'
 
       - name: Run sync
+        id: sync
         if: ${{ github.event.inputs.mode != 'verify' }}
         env:
           TYPEFORM_TOKEN: ${{ secrets.TYPEFORM_TOKEN }}
           TYPEFORM_FORM_ID: ${{ secrets.TYPEFORM_FORM_ID }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
-        run: python sync.py
+        run: |
+          python sync.py 2>&1 | tee sync_output.txt
+          echo "sync_output<<EOF" >> $GITHUB_OUTPUT
+          tail -20 sync_output.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Run data integrity check
         if: ${{ github.event.inputs.mode == 'verify' }}
@@ -43,3 +48,50 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
         run: python sync.py --verify
+
+      - name: Notify Slack on failure
+        if: failure() && secrets.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          SUMMARY=$(tail -5 sync_output.txt 2>/dev/null || echo "No output captured")
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$(python3 -c "
+          import json, sys
+          print(json.dumps({
+              'text': ':rotating_light: *Typeform → Notion Sync FAILED*\n\`\`\`' + sys.argv[1][:500] + '\`\`\`\n<https://github.com/zionkim20/typeform-notion-sync/actions|View Logs>',
+              'unfurl_links': False
+          }))
+          " "$SUMMARY")"
+
+      - name: Notify Slack on data issues
+        if: success() && secrets.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          # Only notify if there were updates, warnings, or not-found clients
+          if grep -qE "(UPDATED|NOT FOUND|WARNING|MATCH WARNING)" sync_output.txt 2>/dev/null; then
+            UPDATED=$(grep -c "UPDATED" sync_output.txt 2>/dev/null || echo 0)
+            NOT_FOUND=$(grep -c "NOT FOUND" sync_output.txt 2>/dev/null || echo 0)
+            WARNINGS=$(grep -c "MATCH WARNING" sync_output.txt 2>/dev/null || echo 0)
+            SUMMARY=$(tail -5 sync_output.txt 2>/dev/null || echo "")
+
+            if [ "$WARNINGS" -gt 0 ] || [ "$NOT_FOUND" -gt 0 ]; then
+              EMOJI=":warning:"
+              LABEL="Sync completed with issues"
+            else
+              EMOJI=":white_check_mark:"
+              LABEL="Sync completed"
+            fi
+
+            curl -s -X POST "$SLACK_WEBHOOK_URL" \
+              -H 'Content-Type: application/json' \
+              -d "$(python3 -c "
+          import json, sys
+          print(json.dumps({
+              'text': sys.argv[1] + ' *' + sys.argv[2] + '*\nUpdated: ' + sys.argv[3] + ' | Not found: ' + sys.argv[4] + ' | Match warnings: ' + sys.argv[5] + '\n<https://github.com/zionkim20/typeform-notion-sync/actions|View Details>',
+              'unfurl_links': False
+          }))
+          " "$EMOJI" "$LABEL" "$UPDATED" "$NOT_FOUND" "$WARNINGS")"
+          fi

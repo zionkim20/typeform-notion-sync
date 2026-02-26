@@ -402,6 +402,15 @@ def find_notion_client(last_name, first_name):
             resp = urllib.request.urlopen(req)
             data = json.loads(resp.read().decode())
             results = data.get("results", [])
+
+            # Post-filter: verify the search term matches as a whole word
+            # Prevents "Craft" matching "Beacraft" via Notion's substring contains
+            word_pattern = re.compile(r'\b' + re.escape(search_term.lower()) + r'\b')
+            results = [r for r in results if word_pattern.search(
+                "".join(t.get("plain_text", "") for t in
+                        r.get("properties", {}).get("Task name", {}).get("title", [])).lower()
+            )]
+
             if results:
                 page = results[0]
                 props = page.get("properties", {})
@@ -947,6 +956,7 @@ def main():
     updated = 0
     not_found = 0
     skipped = 0
+    match_warnings = 0
 
     for r in records:
         status_tag = "COMPLETE" if r["completed"] else "PARTIAL"
@@ -985,6 +995,14 @@ def main():
             print()
             continue
 
+        # Match quality check: warn if the matched name looks suspicious
+        tf_name = r["name"].lower()
+        notion_lower = notion_name.lower()
+        name_ok = (r["first"].lower() in notion_lower and r["last"].lower() in notion_lower)
+        if not name_ok:
+            print(f"  MATCH WARNING: '{r['name']}' matched to '{notion_name}' — names don't fully overlap")
+            match_warnings += 1
+
         print(f"  -> Notion: {notion_name}")
 
         try:
@@ -1004,6 +1022,8 @@ def main():
 
     print(f"\n=== DONE ===")
     print(f"Updated: {updated} | Not found: {not_found} | Skipped: {skipped}")
+    if match_warnings:
+        print(f"MATCH WARNINGS: {match_warnings} — review matches above")
     print(f"Total unique responses processed: {len(records)}")
 
     # Exit with error code if everything failed
