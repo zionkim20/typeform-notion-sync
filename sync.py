@@ -85,6 +85,14 @@ AUTONOMY_MAP = {
 # Form field titles (populated at runtime from form definition)
 FORM_FIELD_TITLES = {}  # field_id -> question_title
 
+# Responses to skip (test entries and non-clients)
+SKIP_NAMES = {
+    "test edward bertsch",
+    "pedro test",
+    "zion kim",
+    "sarah mitchell",  # House manager in Notion, not a client
+}
+
 # === Structured Profile Routing ===
 # Maps keyword in question title -> (internal_key, sub_label)
 # internal_key determines which Notion property the answer goes to
@@ -959,6 +967,11 @@ def main():
     match_warnings = 0
 
     for r in records:
+        # Skip known test entries and non-clients
+        if r["name"].lower().strip() in SKIP_NAMES:
+            skipped += 1
+            continue
+
         status_tag = "COMPLETE" if r["completed"] else "PARTIAL"
         print(f"-- {r['name']} ({r['submitted']}) [{status_tag}] --")
         if r["capabilities"]:
