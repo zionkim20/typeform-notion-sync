@@ -90,7 +90,18 @@ SKIP_NAMES = {
     "test edward bertsch",
     "pedro test",
     "zion kim",
-    "sarah mitchell",  # House manager in Notion, not a client
+}
+
+# Known-good name mismatches (spouses, nicknames) — suppress match warnings
+# Format: (typeform_name_lower, notion_name_lower)
+KNOWN_MATCHES = {
+    ("kendall guinn", "kendal guinn"),         # Typo in Notion (missing L)
+    ("andrew guinn", "kendal guinn"),          # Spouse
+    ("linda salomon", "bruce salomon"),         # Spouse
+    ("dan & grecia ferrari", "daniel ferrari"), # Nickname
+    ("marlena lyon", "chris lyon"),             # Spouse
+    ("debbie schneider", "debra schneider"),    # Nickname
+    ("jeffrey hall", "jeff hall"),              # Nickname
 }
 
 # === Structured Profile Routing ===
@@ -1009,12 +1020,16 @@ def main():
             continue
 
         # Match quality check: warn if the matched name looks suspicious
-        tf_name = r["name"].lower()
-        notion_lower = notion_name.lower()
+        tf_name = r["name"].lower().strip()
+        notion_lower = notion_name.lower().strip()
         name_ok = (r["first"].lower() in notion_lower and r["last"].lower() in notion_lower)
         if not name_ok:
-            print(f"  MATCH WARNING: '{r['name']}' matched to '{notion_name}' — names don't fully overlap")
-            match_warnings += 1
+            # Check if this is a known-good match (spouses, nicknames)
+            if (tf_name, notion_lower) in KNOWN_MATCHES:
+                print(f"  Known match: '{r['name']}' -> '{notion_name}'")
+            else:
+                print(f"  MATCH WARNING: '{r['name']}' matched to '{notion_name}' — names don't fully overlap")
+                match_warnings += 1
 
         print(f"  -> Notion: {notion_name}")
 
