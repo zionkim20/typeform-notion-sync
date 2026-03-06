@@ -979,7 +979,8 @@ def main():
 
     for r in records:
         # Skip known test entries and non-clients
-        if r["name"].lower().strip() in SKIP_NAMES:
+        clean_name = re.sub(r'\s+', ' ', r["name"].lower().strip())
+        if clean_name in SKIP_NAMES:
             skipped += 1
             continue
 
