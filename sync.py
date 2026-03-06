@@ -981,8 +981,12 @@ def main():
         # Skip known test entries and non-clients
         clean_name = re.sub(r'\s+', ' ', r["name"].lower().strip())
         if clean_name in SKIP_NAMES:
+            print(f"  [debug] Skipping '{r['name']}' (in SKIP_NAMES)")
             skipped += 1
             continue
+        # Debug: show name repr for NOT FOUND diagnosis
+        if clean_name.startswith("sarah") or clean_name.startswith("test") or clean_name.startswith("pedro") or clean_name.startswith("zion"):
+            print(f"  [debug] Name not skipped: repr={repr(r['name'])}, clean={repr(clean_name)}")
 
         status_tag = "COMPLETE" if r["completed"] else "PARTIAL"
         print(f"-- {r['name']} ({r['submitted']}) [{status_tag}] --")
