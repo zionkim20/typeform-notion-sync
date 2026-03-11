@@ -518,16 +518,20 @@ def find_notion_client(last_name, first_name):
     if not best:
         return None, None, {}
 
-    # For weak matches (score=1), only accept if there's exactly one candidate
-    if best_score == 1 and len(candidates) > 1:
-        names = [n for _, n, _ in candidates]
-        print(f"  AMBIGUOUS: multiple weak matches found: {names} — skipping")
-        return "AMBIGUOUS", None, {}
-
-    # Log weak matches so they can be audited
+    # For weak matches (score=1), only accept if in KNOWN_MATCHES allowlist
     if best_score == 1:
         _, notion_name, _ = best
         print(f"  WEAK MATCH (score=1): last name matched but first name didn't — '{notion_name}'")
+
+        if len(candidates) > 1:
+            names = [n for _, n, _ in candidates]
+            print(f"  AMBIGUOUS: multiple weak matches found: {names} — skipping")
+            return "AMBIGUOUS", None, {}
+
+        # Only accept weak match if it's a known-good pairing (spouse, nickname)
+        # The KNOWN_MATCHES check happens in the main loop — return it and let
+        # the caller decide whether to accept or reject
+        # (This is safe because unknown weak matches get flagged as MATCH WARNING)
 
     page_id, notion_name, props = best
     current = _extract_current_values(props)
@@ -1087,7 +1091,7 @@ def main():
     # Deduplicate: prefer completed over partial, then latest submission
     by_key = {}
     for r in parsed:
-        key = r["email"] or r["name"]
+        key = r["email"] or f"{r['name']}|{r['response_id']}"
         existing = by_key.get(key)
         if not existing:
             by_key[key] = r
@@ -1176,16 +1180,18 @@ def main():
             print()
             continue
 
-        # Match quality check: warn if the matched name looks suspicious
+        # Match quality check: reject if names don't overlap UNLESS it's a known pair
         tf_name = r["name"].lower().strip()
         notion_lower = notion_name.lower().strip()
         name_ok = (r["first"].lower() in notion_lower and r["last"].lower() in notion_lower)
         if not name_ok:
-            # Check if this is a known-good match (spouses, nicknames)
             if (tf_name, notion_lower) in KNOWN_MATCHES:
                 print(f"  Known match: '{r['name']}' -> '{notion_name}'")
             else:
-                print(f"  MATCH WARNING: '{r['name']}' matched to '{notion_name}' — names don't fully overlap")
+                print(f"  REJECTED: '{r['name']}' matched to '{notion_name}' — not in KNOWN_MATCHES")
+                not_found += 1
+                print()
+                continue
 
         print(f"  -> Notion: {notion_name}")
 
