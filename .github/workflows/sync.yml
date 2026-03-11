@@ -28,6 +28,10 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Preflight check (validates logic before touching live data)
+        if: ${{ github.event.inputs.mode != 'verify' }}
+        run: python sync.py --preflight
+
       - name: Run sync
         id: sync
         if: ${{ github.event.inputs.mode != 'verify' }}

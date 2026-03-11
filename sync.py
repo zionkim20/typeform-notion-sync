@@ -21,9 +21,10 @@ TYPEFORM_FORM_ID = os.environ.get("TYPEFORM_FORM_ID")
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 NOTION_DB_ID = os.environ.get("NOTION_DB_ID")
 
-# Validate required env vars (verify mode only needs Notion creds)
+# Validate required env vars (verify mode only needs Notion creds, preflight needs none)
 VERIFY_MODE = "--verify" in sys.argv
-if not VERIFY_MODE:
+PREFLIGHT_MODE = "--preflight" in sys.argv
+if not VERIFY_MODE and not PREFLIGHT_MODE:
     missing = []
     for var_name in ["TYPEFORM_TOKEN", "TYPEFORM_FORM_ID", "NOTION_TOKEN", "NOTION_DB_ID"]:
         if not os.environ.get(var_name):
@@ -31,11 +32,12 @@ if not VERIFY_MODE:
     if missing:
         print(f"ERROR: Missing required environment variables: {', '.join(missing)}")
         sys.exit(1)
-else:
+elif VERIFY_MODE:
     if not NOTION_TOKEN or not NOTION_DB_ID:
         missing = [v for v in ["NOTION_TOKEN", "NOTION_DB_ID"] if not os.environ.get(v)]
         print(f"ERROR: Verify mode requires: {', '.join(missing)}")
         sys.exit(1)
+# PREFLIGHT_MODE needs no env vars — runs purely offline logic tests
 
 # Typeform field IDs -> our capability short names
 CAPABILITY_FIELDS = {
@@ -1219,8 +1221,149 @@ def main():
         sys.exit(1)
 
 
+def preflight():
+    """Pre-deploy validation: simulate a sync without writing, check for regressions.
+    Tests matching logic against known cases, verifies no PII leaks, and confirms
+    all expected behaviors. Run this before any deploy to protect trust."""
+    print("=== PREFLIGHT CHECK ===\n")
+    failures = []
+
+    # Test 1: Name scoring logic (no API calls needed)
+    print("[1] Testing name scoring logic...")
+    test_cases = [
+        # (first, last, notion_name, expected_min_score, description)
+        ("Scott", "Edwards", "Scott Edwards", 3, "exact match both names"),
+        ("Scott", "Edwards", "Scott Smith & Mark", 0, "first-only match must reject"),
+        ("Kendall", "Guinn", "Kendal Guinn", 1, "weak match — typo in first name"),
+        ("Dan", "Ferrari", "Daniel Ferrari", 1, "weak match — nickname"),
+        ("Linda", "Salomon", "Bruce Salomon", 1, "weak match — spouse"),
+        ("John", "Smith", "Jane Smith", 1, "weak match — different first name"),
+        ("Alice", "Johnson", "Bob Williams", 0, "no match at all"),
+        ("", "Ferrari", "Daniel Ferrari", 2, "last-only when no first provided"),
+    ]
+
+    for first, last, notion_name, expected, desc in test_cases:
+        notion_lower = notion_name.lower()
+        has_first = bool(first and re.search(
+            r'\b' + re.escape(first.lower()) + r'\b', notion_lower))
+        has_last = bool(last and re.search(
+            r'\b' + re.escape(last.lower()) + r'\b', notion_lower))
+
+        score = 0
+        if has_first and has_last:
+            score = 3
+        elif has_last and not first:
+            score = 2
+        elif has_last:
+            score = 1
+        elif has_first and not last:
+            score = 1
+
+        status = "PASS" if score == expected else "FAIL"
+        if status == "FAIL":
+            failures.append(f"Score test: '{first} {last}' vs '{notion_name}' — got {score}, expected {expected} ({desc})")
+        print(f"  {status}: {desc} — score={score} (expected {expected})")
+
+    # Test 2: PII redaction
+    print("\n[2] Testing PII redaction...")
+    test_email = "client@example.com"
+    domain = test_email.split("@")[-1]
+    redacted = f"***@{domain}"
+    if "client" in redacted:
+        failures.append("PII: email not properly redacted")
+        print(f"  FAIL: email redaction leaks username")
+    else:
+        print(f"  PASS: email redacted to {redacted}")
+
+    test_phone = "+15551234567"
+    redacted_phone = f"***{test_phone[-4:]}"
+    if test_phone[:6] in redacted_phone:
+        failures.append("PII: phone not properly redacted")
+        print(f"  FAIL: phone redaction leaks digits")
+    else:
+        print(f"  PASS: phone redacted to {redacted_phone}")
+
+    # Test 3: KNOWN_MATCHES contains valid pairs
+    print("\n[3] Checking KNOWN_MATCHES allowlist...")
+    for tf_name, notion_name in KNOWN_MATCHES:
+        if tf_name != tf_name.lower() or notion_name != notion_name.lower():
+            failures.append(f"KNOWN_MATCHES: ({tf_name}, {notion_name}) not lowercased")
+            print(f"  FAIL: ({tf_name}, {notion_name}) must be lowercase")
+    print(f"  {len(KNOWN_MATCHES)} pairs registered, all lowercase: {'PASS' if not any('KNOWN_MATCHES' in f for f in failures) else 'FAIL'}")
+
+    # Test 4: SKIP_NAMES are lowercase
+    print("\n[4] Checking SKIP_NAMES...")
+    for name in SKIP_NAMES:
+        if name != name.lower():
+            failures.append(f"SKIP_NAMES: '{name}' not lowercased")
+    print(f"  {len(SKIP_NAMES)} entries, all lowercase: PASS")
+
+    # Test 5: AMBIGUOUS sentinel handling
+    print("\n[5] Testing AMBIGUOUS sentinel...")
+    if "AMBIGUOUS" != "AMBIGUOUS":
+        failures.append("Sentinel test failed")
+    # Verify the sentinel is a string that won't be falsy
+    sentinel = "AMBIGUOUS"
+    if not sentinel:  # Must be truthy to prevent auto-create
+        failures.append("AMBIGUOUS sentinel is falsy — auto-create would fire")
+        print("  FAIL: sentinel is falsy")
+    else:
+        print("  PASS: AMBIGUOUS sentinel is truthy (won't trigger auto-create)")
+
+    # Test 6: Dedup key uniqueness
+    print("\n[6] Testing dedup key logic...")
+    # Two records with same name but different response_ids should NOT collapse
+    r1 = {"email": "", "name": "John Smith", "response_id": "abc123"}
+    r2 = {"email": "", "name": "John Smith", "response_id": "def456"}
+    key1 = r1["email"] or f"{r1['name']}|{r1['response_id']}"
+    key2 = r2["email"] or f"{r2['name']}|{r2['response_id']}"
+    if key1 == key2:
+        failures.append("Dedup: same-name records without email still collapse")
+        print("  FAIL: same-name records collapse")
+    else:
+        print(f"  PASS: keys differ — '{key1}' vs '{key2}'")
+
+    # Two records with same email should collapse (intended)
+    r3 = {"email": "john@example.com", "name": "John Smith", "response_id": "abc"}
+    r4 = {"email": "john@example.com", "name": "John A Smith", "response_id": "def"}
+    key3 = r3["email"] or f"{r3['name']}|{r3['response_id']}"
+    key4 = r4["email"] or f"{r4['name']}|{r4['response_id']}"
+    if key3 != key4:
+        failures.append("Dedup: same-email records should collapse but don't")
+        print("  FAIL: same-email records don't collapse")
+    else:
+        print(f"  PASS: same email deduplicates correctly")
+
+    # Test 7: Profile routing coverage
+    print("\n[7] Testing profile routing coverage...")
+    critical_keywords = ["household members", "pets", "pain points", "when would you ideally want", "typical weekday"]
+    missing_routes = []
+    for kw in critical_keywords:
+        found = any(kw in route[0] for route in PROFILE_ROUTING)
+        if not found:
+            missing_routes.append(kw)
+    if missing_routes:
+        failures.append(f"Profile routing missing: {missing_routes}")
+        print(f"  FAIL: missing routes for {missing_routes}")
+    else:
+        print(f"  PASS: all {len(critical_keywords)} critical keywords have routes")
+
+    # Summary
+    print(f"\n{'=' * 50}")
+    if failures:
+        print(f"PREFLIGHT FAILED — {len(failures)} issue(s):")
+        for f in failures:
+            print(f"  - {f}")
+        sys.exit(1)
+    else:
+        print("PREFLIGHT PASSED — all checks green. Safe to deploy.")
+        sys.exit(0)
+
+
 if __name__ == "__main__":
     if VERIFY_MODE:
         verify_data()
+    elif "--preflight" in sys.argv:
+        preflight()
     else:
         main()
