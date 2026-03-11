@@ -327,7 +327,7 @@ def discover_contact_fields(responses):
         if atype == "phone_number":
             CONTACT_FIELDS["phone"] = fid
         # Address fields: check ref for keywords
-        elif "street" in ref or "address" in ref and "line" not in ref:
+        elif ("street" in ref or "address" in ref) and "line" not in ref:
             CONTACT_FIELDS["street"] = fid
         elif "line_2" in ref or "line-2" in ref or "address_line" in ref or "address-line" in ref:
             CONTACT_FIELDS["address_line_2"] = fid
@@ -396,16 +396,56 @@ def ensure_profile_properties():
     return True
 
 
+def _extract_current_values(props):
+    """Extract current field values from a Notion page's properties."""
+    current = {
+        "email": props.get("Email", {}).get("email", "") or "",
+        "phone": props.get("Phone", {}).get("phone_number", "") or "",
+        "address": "".join(
+            t.get("plain_text", "")
+            for t in props.get("Client Address", {}).get("rich_text", [])
+        ).strip(),
+        "city": "".join(
+            t.get("plain_text", "")
+            for t in props.get("City", {}).get("rich_text", [])
+        ).strip(),
+        "state": (props.get("State", {}).get("select") or {}).get("name", ""),
+    }
+
+    # Read all profile properties
+    for internal_key, notion_prop in PROFILE_NOTION_PROPERTIES.items():
+        rt = props.get(notion_prop, {}).get("rich_text", [])
+        current[internal_key] = "".join(
+            t.get("plain_text", "") for t in rt
+        ).strip()
+
+    return current
+
+
+def _get_notion_name(props):
+    """Get the client name from Notion page properties."""
+    title_parts = props.get("Task name", {}).get("title", [])
+    return "".join([t.get("plain_text", "") for t in title_parts])
+
+
 def find_notion_client(last_name, first_name):
-    """Search Notion for a client record by name. Returns page_id, name, and current values."""
-    # Try last name first (more unique)
+    """Search Notion for a client record by name. Returns page_id, name, and current values.
+
+    Matching rules:
+    - If both first and last name are provided, BOTH must appear as whole words in the Notion title.
+    - Falls back to last-name-only match if first+last yields nothing (handles "Dan & Grecia Ferrari").
+    - Single-name matches are only accepted if there's exactly one result (prevents "Scott" matching many).
+    """
+    candidates = []
+
+    # Search by last name first (more unique), then first name as fallback
     for search_term in [last_name, first_name]:
         if not search_term:
             continue
 
         body = json.dumps({
             "filter": {"property": "Task name", "title": {"contains": search_term}},
-            "page_size": 3
+            "page_size": 5
         }).encode()
 
         req = urllib.request.Request(
@@ -424,48 +464,140 @@ def find_notion_client(last_name, first_name):
             results = data.get("results", [])
 
             # Post-filter: verify the search term matches as a whole word
-            # Prevents "Craft" matching "Beacraft" via Notion's substring contains
             word_pattern = re.compile(r'\b' + re.escape(search_term.lower()) + r'\b')
-            results = [r for r in results if word_pattern.search(
-                "".join(t.get("plain_text", "") for t in
-                        r.get("properties", {}).get("Task name", {}).get("title", [])).lower()
-            )]
+            for r in results:
+                props = r.get("properties", {})
+                notion_name = _get_notion_name(props)
+                if word_pattern.search(notion_name.lower()):
+                    candidates.append((r["id"], notion_name, props))
 
-            if results:
-                page = results[0]
-                props = page.get("properties", {})
-                title_parts = props.get("Task name", {}).get("title", [])
-                notion_name = "".join([t.get("plain_text", "") for t in title_parts])
-
-                # Extract current field values to avoid overwriting
-                current = {
-                    "email": props.get("Email", {}).get("email", "") or "",
-                    "phone": props.get("Phone", {}).get("phone_number", "") or "",
-                    "address": "".join(
-                        t.get("plain_text", "")
-                        for t in props.get("Client Address", {}).get("rich_text", [])
-                    ).strip(),
-                    "city": "".join(
-                        t.get("plain_text", "")
-                        for t in props.get("City", {}).get("rich_text", [])
-                    ).strip(),
-                    "state": (props.get("State", {}).get("select") or {}).get("name", ""),
-                }
-
-                # Read all profile properties
-                for internal_key, notion_prop in PROFILE_NOTION_PROPERTIES.items():
-                    rt = props.get(notion_prop, {}).get("rich_text", [])
-                    current[internal_key] = "".join(
-                        t.get("plain_text", "") for t in rt
-                    ).strip()
-
-                return page["id"], notion_name, current
         except Exception as e:
             print(f"  Search error for '{search_term}': {e}")
 
         time.sleep(0.35)
 
-    return None, None, {}
+    if not candidates:
+        return None, None, {}
+
+    # Deduplicate by page_id
+    seen = set()
+    unique = []
+    for page_id, name, props in candidates:
+        if page_id not in seen:
+            seen.add(page_id)
+            unique.append((page_id, name, props))
+    candidates = unique
+
+    # Score each candidate: require BOTH first AND last name to match
+    best = None
+    best_score = 0
+
+    for page_id, notion_name, props in candidates:
+        notion_lower = notion_name.lower()
+        score = 0
+
+        has_first = bool(first_name and re.search(
+            r'\b' + re.escape(first_name.lower()) + r'\b', notion_lower))
+        has_last = bool(last_name and re.search(
+            r'\b' + re.escape(last_name.lower()) + r'\b', notion_lower))
+
+        if has_first and has_last:
+            score = 3  # Both match — strong
+        elif has_last and not first_name:
+            score = 2  # Only last name provided and it matches
+        elif has_last:
+            score = 1  # Last name matches but first doesn't (e.g. "Dan & Grecia Ferrari")
+        elif has_first and not last_name:
+            score = 1  # Only first name provided
+        # If only first name matches but last doesn't — score stays 0 (reject)
+
+        if score > best_score:
+            best_score = score
+            best = (page_id, notion_name, props)
+
+    if not best:
+        return None, None, {}
+
+    # For weak matches (score=1), only accept if there's exactly one candidate
+    if best_score == 1 and len(candidates) > 1:
+        names = [n for _, n, _ in candidates]
+        print(f"  AMBIGUOUS: multiple weak matches found: {names} — skipping")
+        return "AMBIGUOUS", None, {}
+
+    # Log weak matches so they can be audited
+    if best_score == 1:
+        _, notion_name, _ = best
+        print(f"  WEAK MATCH (score=1): last name matched but first name didn't — '{notion_name}'")
+
+    page_id, notion_name, props = best
+    current = _extract_current_values(props)
+    return page_id, notion_name, current
+
+
+def create_notion_client(record):
+    """Create a new client row in Notion from a Typeform response.
+    Only creates for completed responses with at least a name and email."""
+    name = record["name"]
+    if not name:
+        return None
+
+    properties = {
+        "Task name": {"title": [{"text": {"content": name}}]},
+        "Typeform Status": {"select": {"name": "Complete" if record["completed"] else "Partial"}},
+    }
+
+    # Contact info
+    if record["email"]:
+        properties["Email"] = {"email": record["email"]}
+    if record["phone"]:
+        properties["Phone"] = {"phone_number": record["phone"]}
+    if record["address"]:
+        properties["Client Address"] = {
+            "rich_text": [{"text": {"content": record["address"][:2000]}}]
+        }
+    if record["city"]:
+        properties["City"] = {
+            "rich_text": [{"text": {"content": record["city"]}}]
+        }
+    if record["state"]:
+        properties["State"] = {"select": {"name": record["state"]}}
+
+    # Capabilities
+    if record["capabilities"]:
+        properties["Capability Requirements"] = {
+            "rich_text": [{"text": {"content": record["capabilities"]}}]
+        }
+    if record["relational"]:
+        properties["Relational Preference"] = {"select": {"name": record["relational"]}}
+    if record["autonomy"]:
+        properties["Decision Autonomy"] = {"select": {"name": record["autonomy"]}}
+
+    # Profile fields
+    for internal_key, notion_prop in PROFILE_NOTION_PROPERTIES.items():
+        value = record.get("profile_fields", {}).get(internal_key, "")
+        if value:
+            properties[notion_prop] = {
+                "rich_text": [{"text": {"content": value[:2000]}}]
+            }
+
+    body = json.dumps({
+        "parent": {"database_id": NOTION_DB_ID},
+        "properties": properties,
+    }).encode()
+
+    req = urllib.request.Request(
+        "https://api.notion.com/v1/pages",
+        data=body, method="POST",
+        headers={
+            "Authorization": f"Bearer {NOTION_TOKEN}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json"
+        }
+    )
+
+    resp = urllib.request.urlopen(req)
+    result = json.loads(resp.read().decode())
+    return result.get("id")
 
 
 def update_notion(page_id, record, current_values):
@@ -974,9 +1106,9 @@ def main():
 
     # Step 3: Match and update
     updated = 0
+    created = 0
     not_found = 0
     skipped = 0
-    match_warnings = 0
 
     for r in records:
         # Skip known test entries and non-clients
@@ -993,14 +1125,15 @@ def main():
             print(f"  Caps: (none)")
         print(f"  Rel: {r['relational']} | Aut: {r['autonomy']}")
 
-        # Show contact info in logs
+        # Show contact info in logs (redacted — full PII stays out of CI logs)
         contact_parts = []
         if r["email"]:
-            contact_parts.append(f"email={r['email']}")
+            domain = r["email"].split("@")[-1] if "@" in r["email"] else "?"
+            contact_parts.append(f"email=***@{domain}")
         if r["phone"]:
-            contact_parts.append(f"phone={r['phone']}")
+            contact_parts.append(f"phone=***{r['phone'][-4:]}")
         if r["address"]:
-            contact_parts.append(f"addr={r['address'][:40]}")
+            contact_parts.append("addr=yes")
         if r["city"]:
             contact_parts.append(f"city={r['city']}")
         if contact_parts:
@@ -1015,9 +1148,31 @@ def main():
         page_id, notion_name, current = find_notion_client(r["last"], r["first"])
         time.sleep(0.35)
 
+        if page_id == "AMBIGUOUS":
+            print(f"  SKIPPED: ambiguous match — needs manual review")
+            skipped += 1
+            print()
+            continue
+
         if not page_id:
-            print(f"  NOT FOUND in Notion")
-            not_found += 1
+            # Auto-create new client row if response is completed and has email
+            if r["completed"] and r["email"]:
+                print(f"  NOT FOUND — creating new client row...")
+                try:
+                    new_id = create_notion_client(r)
+                    if new_id:
+                        print(f"  CREATED: {r['name']} (page {new_id[:8]}...)")
+                        created += 1
+                    else:
+                        print(f"  CREATE FAILED: no page ID returned")
+                        not_found += 1
+                except Exception as e:
+                    print(f"  CREATE ERROR: {e}")
+                    not_found += 1
+            else:
+                reason = "partial response" if not r["completed"] else "no email"
+                print(f"  NOT FOUND in Notion (skipping auto-create: {reason})")
+                not_found += 1
             print()
             continue
 
@@ -1031,7 +1186,6 @@ def main():
                 print(f"  Known match: '{r['name']}' -> '{notion_name}'")
             else:
                 print(f"  MATCH WARNING: '{r['name']}' matched to '{notion_name}' — names don't fully overlap")
-                match_warnings += 1
 
         print(f"  -> Notion: {notion_name}")
 
@@ -1051,13 +1205,11 @@ def main():
         print()
 
     print(f"\n=== DONE ===")
-    print(f"Updated: {updated} | Not found: {not_found} | Skipped: {skipped}")
-    if match_warnings:
-        print(f"MATCH WARNINGS: {match_warnings} — review matches above")
+    print(f"Updated: {updated} | Created: {created} | Not found: {not_found} | Skipped: {skipped}")
     print(f"Total unique responses processed: {len(records)}")
 
-    # Exit with error code if everything failed
-    if updated == 0 and len(records) > 0 and skipped == len(records):
+    # Exit with error code if nothing succeeded
+    if updated == 0 and created == 0 and len(records) > 0:
         sys.exit(1)
 
 

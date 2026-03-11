@@ -74,29 +74,41 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL: ${{ secrets.SLACK_ZION_DM_CHANNEL }}
         run: |
-          # Only notify if there were updates, warnings, or not-found clients
-          if grep -qE "(UPDATED|NOT FOUND|MATCH WARNING)" sync_output.txt 2>/dev/null; then
+          # Only notify if there were updates, creations, or issues
+          if grep -qE "(UPDATED|CREATED|NOT FOUND|AMBIGUOUS)" sync_output.txt 2>/dev/null; then
             UPDATED=$(grep -c "UPDATED" sync_output.txt 2>/dev/null || echo 0)
+            CREATED=$(grep -c "CREATED" sync_output.txt 2>/dev/null || echo 0)
             NOT_FOUND=$(grep -c "NOT FOUND" sync_output.txt 2>/dev/null || echo 0)
-            WARNINGS=$(grep -c "MATCH WARNING" sync_output.txt 2>/dev/null || echo 0)
+            AMBIGUOUS=$(grep -c "AMBIGUOUS" sync_output.txt 2>/dev/null || echo 0)
 
-            if [ "$WARNINGS" -gt 0 ] || [ "$NOT_FOUND" -gt 0 ]; then
+            if [ "$NOT_FOUND" -gt 0 ] || [ "$AMBIGUOUS" -gt 0 ]; then
               EMOJI=":warning:"
               LABEL="Sync completed with issues"
+            elif [ "$CREATED" -gt 0 ]; then
+              EMOJI=":sparkles:"
+              LABEL="Sync completed (new clients created)"
             else
               EMOJI=":white_check_mark:"
               LABEL="Sync completed"
+            fi
+
+            SUMMARY="Updated: $UPDATED | Created: $CREATED"
+            if [ "$NOT_FOUND" -gt 0 ]; then
+              SUMMARY="$SUMMARY | Not found: $NOT_FOUND"
+            fi
+            if [ "$AMBIGUOUS" -gt 0 ]; then
+              SUMMARY="$SUMMARY | Ambiguous: $AMBIGUOUS"
             fi
 
             python3 -c "
           import json, urllib.request, sys, os
           body = json.dumps({
               'channel': os.environ['SLACK_CHANNEL'],
-              'text': sys.argv[1] + ' *' + sys.argv[2] + '*\nUpdated: ' + sys.argv[3] + ' | Not found: ' + sys.argv[4] + ' | Match warnings: ' + sys.argv[5] + '\n<https://github.com/zionkim20/typeform-notion-sync/actions|View Details>'
+              'text': sys.argv[1] + ' *' + sys.argv[2] + '*\n' + sys.argv[3] + '\n<https://github.com/zionkim20/typeform-notion-sync/actions|View Details>'
           }).encode()
           req = urllib.request.Request('https://slack.com/api/chat.postMessage',
               data=body, method='POST',
               headers={'Authorization': 'Bearer ' + os.environ['SLACK_BOT_TOKEN'], 'Content-Type': 'application/json'})
           urllib.request.urlopen(req)
-          " "$EMOJI" "$LABEL" "$UPDATED" "$NOT_FOUND" "$WARNINGS"
+          " "$EMOJI" "$LABEL" "$SUMMARY"
           fi
