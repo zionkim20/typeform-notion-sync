@@ -461,12 +461,14 @@ def _query_notion(filter_body):
         return []
 
 
-def find_notion_client(email, last_name, first_name):
-    """Find a client in Notion. Email-first, name as fallback.
+def find_notion_client(email, last_name, first_name, address=""):
+    """Find a client in Notion. Email-first, name fallback, spouse detection.
 
-    1. Exact email match → return immediately
-    2. Name match (both first AND last as whole words) → return
-    3. No match → return None (caller will auto-create)
+    Returns (page_id, notion_name, current_values, match_type) where match_type is:
+    - "email" — exact email match
+    - "name" — both first and last name match
+    - "spouse" — last name + address match (different first name = spouse)
+    - None — no match found
     """
     # Step 1: Search by email (exact match — most reliable)
     if email:
@@ -477,10 +479,10 @@ def find_notion_client(email, last_name, first_name):
         if results:
             page_id, notion_name, props = results[0]
             print(f"  Matched by email: {notion_name}")
-            return page_id, notion_name, _extract_current_values(props)
+            return page_id, notion_name, _extract_current_values(props), "email"
         time.sleep(0.35)
 
-    # Step 2: Search by name (both first AND last must match as whole words)
+    # Step 2 & 3: Search by last name — check for exact name match OR spouse match
     if last_name:
         results = _query_notion({
             "filter": {"property": "Task name", "title": {"contains": last_name}},
@@ -488,8 +490,9 @@ def find_notion_client(email, last_name, first_name):
         })
         time.sleep(0.35)
 
+        spouse_candidate = None
+
         if results:
-            # Post-filter: require BOTH first and last name as whole words
             for page_id, notion_name, props in results:
                 notion_lower = notion_name.lower()
                 has_last = bool(re.search(
@@ -498,10 +501,51 @@ def find_notion_client(email, last_name, first_name):
                     r'\b' + re.escape(first_name.lower()) + r'\b', notion_lower))
 
                 if has_first and has_last:
+                    # Step 2: exact name match
                     print(f"  Matched by name: {notion_name}")
-                    return page_id, notion_name, _extract_current_values(props)
+                    return page_id, notion_name, _extract_current_values(props), "name"
 
-    return None, None, {}
+                if has_last and not has_first and address:
+                    # Potential spouse: same last name, different first name
+                    # Check if address matches
+                    current = _extract_current_values(props)
+                    existing_addr = current.get("address", "").lower().strip()
+                    new_addr = address.lower().strip()
+
+                    if existing_addr and new_addr and _addresses_match(existing_addr, new_addr):
+                        spouse_candidate = (page_id, notion_name, current)
+
+            # Step 3: spouse match (last name + address)
+            if spouse_candidate:
+                page_id, notion_name, current = spouse_candidate
+                print(f"  SPOUSE MATCH: same last name + same address as '{notion_name}'")
+                return page_id, notion_name, current, "spouse"
+
+    return None, None, {}, None
+
+
+def _addresses_match(addr1, addr2):
+    """Check if two addresses refer to the same location.
+    Compares the street number + first word of street name to handle
+    minor formatting differences (Dr vs Drive, St vs Street, etc.)."""
+    # Extract street number from each
+    num1 = re.match(r'(\d+)', addr1)
+    num2 = re.match(r'(\d+)', addr2)
+
+    if not num1 or not num2:
+        return False
+
+    if num1.group(1) != num2.group(1):
+        return False
+
+    # Extract first word after the number (street name start)
+    words1 = addr1[num1.end():].strip().split()
+    words2 = addr2[num2.end():].strip().split()
+
+    if not words1 or not words2:
+        return False
+
+    return words1[0] == words2[0]
 
 
 def create_notion_client(record):
@@ -606,13 +650,32 @@ def update_notion(page_id, record, current_values):
     if record.get("comm_preference"):
         properties["Communication Preference"] = {"select": {"name": record["comm_preference"]}}
 
-    # Profile fields — only fill if currently empty (preserves manual edits)
+    # Profile fields — fill-if-empty OR append for spouse merges
+    # Spouse records have [From Name] prefixed values that should be appended
+    is_spouse = any(v.startswith("[From ") for v in record.get("profile_fields", {}).values() if v)
+
     for internal_key, notion_prop in PROFILE_NOTION_PROPERTIES.items():
         value = record.get("profile_fields", {}).get(internal_key, "")
-        if value and not current_values.get(internal_key):
+        existing = current_values.get(internal_key, "")
+
+        if not value:
+            continue
+
+        if is_spouse and existing:
+            # Spouse merge: append new data to existing, separated by newline
+            merged = f"{existing}\n{value}"
+            properties[notion_prop] = {
+                "rich_text": [{"text": {"content": merged[:2000]}}]
+            }
+        elif not existing:
+            # Normal: fill if empty
             properties[notion_prop] = {
                 "rich_text": [{"text": {"content": value[:2000]}}]
             }
+
+    # Partner email — set if this is a spouse submission
+    if record.get("_partner_email"):
+        properties["Partner email"] = {"email": record["_partner_email"]}
 
     # Always write Typeform Status so team knows full vs partial
     status = "Complete" if record["completed"] else "Partial"
@@ -1131,7 +1194,8 @@ def main():
             filled = [PROFILE_NOTION_PROPERTIES.get(k, k) for k in pf if pf[k]]
             print(f"  Profile: {len(filled)} fields ({', '.join(filled[:4])}{'...' if len(filled) > 4 else ''})")
 
-        page_id, notion_name, current = find_notion_client(r["email"], r["last"], r["first"])
+        page_id, notion_name, current, match_type = find_notion_client(
+            r["email"], r["last"], r["first"], r["address"])
         time.sleep(0.35)
 
         if not page_id:
@@ -1156,6 +1220,17 @@ def main():
             continue
 
         print(f"  -> Notion: {notion_name}")
+
+        # For spouse matches, add attribution to profile fields so team knows who said what
+        if match_type == "spouse":
+            spouse_name = r["first"] or r["name"]
+            for key in r.get("profile_fields", {}):
+                value = r["profile_fields"][key]
+                if value:
+                    r["profile_fields"][key] = f"[From {spouse_name}] {value}"
+            # Add spouse email as partner email if not already set
+            if r["email"] and not current.get("partner_email"):
+                r["_partner_email"] = r["email"]
 
         try:
             success, written = update_notion(page_id, r, current)
@@ -1264,8 +1339,35 @@ def preflight():
     else:
         print(f"  PASS: same email deduplicates correctly")
 
-    # Test 5: Profile routing coverage
-    print("\n[5] Testing profile routing coverage...")
+    # Test 5: Address matching for spouse detection
+    print("\n[5] Testing address matching...")
+    addr_tests = [
+        ("1509 Wilson Heights Drive", "1509 Wilson Heights Dr", True, "same address, Dr vs Drive"),
+        ("230 Country Club Dr", "230 Country Club Drive", True, "same address, abbreviated"),
+        ("1509 Wilson Heights Drive", "8900 Maple Ave", False, "different addresses"),
+        ("1509 Wilson Heights Drive", "", False, "empty existing address"),
+        ("", "1509 Wilson Heights Drive", False, "empty new address"),
+        ("31 KITCHELL RD", "31 kitchell rd", True, "case insensitive"),
+    ]
+    for addr1, addr2, expected, desc in addr_tests:
+        result = _addresses_match(addr1.lower(), addr2.lower()) if addr1 and addr2 else False
+        status = "PASS" if result == expected else "FAIL"
+        if status == "FAIL":
+            failures.append(f"Address match: '{addr1}' vs '{addr2}' — got {result}, expected {expected} ({desc})")
+        print(f"  {status}: {desc}")
+
+    # Test 6: Spouse merge attribution
+    print("\n[6] Testing spouse merge attribution...")
+    test_value = "[From Andrew] 2 adults, 3 kids"
+    is_spouse = test_value.startswith("[From ")
+    if not is_spouse:
+        failures.append("Spouse attribution not detected")
+        print("  FAIL: [From Name] prefix not detected")
+    else:
+        print("  PASS: spouse attribution prefix detected")
+
+    # Test 7: Profile routing coverage
+    print("\n[7] Testing profile routing coverage...")
     critical_keywords = ["household members", "pets", "pain points", "when would you ideally want", "typical weekday"]
     missing_routes = []
     for kw in critical_keywords:
