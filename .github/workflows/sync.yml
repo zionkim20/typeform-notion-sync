@@ -80,10 +80,10 @@ jobs:
         run: |
           # Only notify if there were updates, creations, or issues
           if grep -qE "(UPDATED|CREATED|NOT FOUND|AMBIGUOUS)" sync_output.txt 2>/dev/null; then
-            UPDATED=$(grep -c "UPDATED" sync_output.txt 2>/dev/null || echo 0)
-            CREATED=$(grep -c "CREATED" sync_output.txt 2>/dev/null || echo 0)
-            NOT_FOUND=$(grep -c "NOT FOUND" sync_output.txt 2>/dev/null || echo 0)
-            AMBIGUOUS=$(grep -c "AMBIGUOUS" sync_output.txt 2>/dev/null || echo 0)
+            UPDATED=$(grep -c "UPDATED" sync_output.txt 2>/dev/null || true)
+            CREATED=$(grep -c "CREATED" sync_output.txt 2>/dev/null || true)
+            NOT_FOUND=$(grep -c "NOT FOUND" sync_output.txt 2>/dev/null || true)
+            AMBIGUOUS=$(grep -c "AMBIGUOUS" sync_output.txt 2>/dev/null || true)
 
             if [ "$NOT_FOUND" -gt 0 ] || [ "$AMBIGUOUS" -gt 0 ]; then
               EMOJI=":warning:"
