@@ -58,6 +58,14 @@ FIELD_LAST_NAME = "KR7LISBiu7yD"
 FIELD_EMAIL = "wPikONTZh8zZ"
 FIELD_RELATIONAL = "GrQyr8j5sFPl"
 FIELD_AUTONOMY = "l7riGwpkiDZK"
+FIELD_COMM_PREFERENCE = None  # Set after Typeform question is added — field ID TBD
+
+# Communication preference mapping (Typeform choice label -> Notion select value)
+COMM_PREFERENCE_MAP = {
+    "sms": "SMS",
+    "text": "SMS",
+    "email": "Email",
+}
 
 # Contact info field IDs (verified from form gFojEmRj)
 CONTACT_FIELDS = {
@@ -93,18 +101,6 @@ SKIP_NAMES = {
     "pedro test",
     "zion kim",
     "sarah mitchell",
-}
-
-# Known-good name mismatches (spouses, nicknames) — suppress match warnings
-# Format: (typeform_name_lower, notion_name_lower)
-KNOWN_MATCHES = {
-    ("kendall guinn", "kendal guinn"),         # Typo in Notion (missing L)
-    ("andrew guinn", "kendal guinn"),          # Spouse
-    ("linda salomon", "bruce salomon"),         # Spouse
-    ("dan & grecia ferrari", "daniel ferrari"), # Nickname
-    ("marlena lyon", "chris lyon"),             # Spouse
-    ("debbie schneider", "debra schneider"),    # Nickname
-    ("jeffrey hall", "jeff hall"),              # Nickname
 }
 
 # === Structured Profile Routing ===
@@ -378,6 +374,15 @@ def ensure_profile_properties():
         if notion_prop not in existing:
             to_create[notion_prop] = {"rich_text": {}}
 
+    # Ensure Communication Preference select property exists
+    if "Communication Preference" not in existing:
+        to_create["Communication Preference"] = {
+            "select": {"options": [
+                {"name": "SMS", "color": "blue"},
+                {"name": "Email", "color": "green"},
+            ]}
+        }
+
     if not to_create:
         print(f"  All {len(PROFILE_NOTION_PROPERTIES)} profile properties exist")
         return True
@@ -430,114 +435,73 @@ def _get_notion_name(props):
     return "".join([t.get("plain_text", "") for t in title_parts])
 
 
-def find_notion_client(last_name, first_name):
-    """Search Notion for a client record by name. Returns page_id, name, and current values.
+def _query_notion(filter_body):
+    """Query Notion database with a filter. Returns list of (page_id, name, props)."""
+    body = json.dumps(filter_body).encode()
+    req = urllib.request.Request(
+        f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
+        data=body, method="POST",
+        headers={
+            "Authorization": f"Bearer {NOTION_TOKEN}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json"
+        }
+    )
+    try:
+        resp = urllib.request.urlopen(req)
+        data = json.loads(resp.read().decode())
+        results = []
+        for r in data.get("results", []):
+            props = r.get("properties", {})
+            notion_name = _get_notion_name(props)
+            results.append((r["id"], notion_name, props))
+        return results
+    except Exception as e:
+        print(f"  Query error: {e}")
+        return []
 
-    Matching rules:
-    - If both first and last name are provided, BOTH must appear as whole words in the Notion title.
-    - Falls back to last-name-only match if first+last yields nothing (handles "Dan & Grecia Ferrari").
-    - Single-name matches are only accepted if there's exactly one result (prevents "Scott" matching many).
+
+def find_notion_client(email, last_name, first_name):
+    """Find a client in Notion. Email-first, name as fallback.
+
+    1. Exact email match → return immediately
+    2. Name match (both first AND last as whole words) → return
+    3. No match → return None (caller will auto-create)
     """
-    candidates = []
-
-    # Search by last name first (more unique), then first name as fallback
-    for search_term in [last_name, first_name]:
-        if not search_term:
-            continue
-
-        body = json.dumps({
-            "filter": {"property": "Task name", "title": {"contains": search_term}},
-            "page_size": 5
-        }).encode()
-
-        req = urllib.request.Request(
-            f"https://api.notion.com/v1/databases/{NOTION_DB_ID}/query",
-            data=body, method="POST",
-            headers={
-                "Authorization": f"Bearer {NOTION_TOKEN}",
-                "Notion-Version": "2022-06-28",
-                "Content-Type": "application/json"
-            }
-        )
-
-        try:
-            resp = urllib.request.urlopen(req)
-            data = json.loads(resp.read().decode())
-            results = data.get("results", [])
-
-            # Post-filter: verify the search term matches as a whole word
-            word_pattern = re.compile(r'\b' + re.escape(search_term.lower()) + r'\b')
-            for r in results:
-                props = r.get("properties", {})
-                notion_name = _get_notion_name(props)
-                if word_pattern.search(notion_name.lower()):
-                    candidates.append((r["id"], notion_name, props))
-
-        except Exception as e:
-            print(f"  Search error for '{search_term}': {e}")
-
+    # Step 1: Search by email (exact match — most reliable)
+    if email:
+        results = _query_notion({
+            "filter": {"property": "Email", "email": {"equals": email}},
+            "page_size": 1,
+        })
+        if results:
+            page_id, notion_name, props = results[0]
+            print(f"  Matched by email: {notion_name}")
+            return page_id, notion_name, _extract_current_values(props)
         time.sleep(0.35)
 
-    if not candidates:
-        return None, None, {}
+    # Step 2: Search by name (both first AND last must match as whole words)
+    if last_name:
+        results = _query_notion({
+            "filter": {"property": "Task name", "title": {"contains": last_name}},
+            "page_size": 5,
+        })
+        time.sleep(0.35)
 
-    # Deduplicate by page_id
-    seen = set()
-    unique = []
-    for page_id, name, props in candidates:
-        if page_id not in seen:
-            seen.add(page_id)
-            unique.append((page_id, name, props))
-    candidates = unique
+        if results:
+            # Post-filter: require BOTH first and last name as whole words
+            for page_id, notion_name, props in results:
+                notion_lower = notion_name.lower()
+                has_last = bool(re.search(
+                    r'\b' + re.escape(last_name.lower()) + r'\b', notion_lower))
+                has_first = bool(first_name and re.search(
+                    r'\b' + re.escape(first_name.lower()) + r'\b', notion_lower))
 
-    # Score each candidate: require BOTH first AND last name to match
-    best = None
-    best_score = 0
+                if has_first and has_last:
+                    print(f"  Matched by name: {notion_name}")
+                    return page_id, notion_name, _extract_current_values(props)
 
-    for page_id, notion_name, props in candidates:
-        notion_lower = notion_name.lower()
-        score = 0
-
-        has_first = bool(first_name and re.search(
-            r'\b' + re.escape(first_name.lower()) + r'\b', notion_lower))
-        has_last = bool(last_name and re.search(
-            r'\b' + re.escape(last_name.lower()) + r'\b', notion_lower))
-
-        if has_first and has_last:
-            score = 3  # Both match — strong
-        elif has_last and not first_name:
-            score = 2  # Only last name provided and it matches
-        elif has_last:
-            score = 1  # Last name matches but first doesn't (e.g. "Dan & Grecia Ferrari")
-        elif has_first and not last_name:
-            score = 1  # Only first name provided
-        # If only first name matches but last doesn't — score stays 0 (reject)
-
-        if score > best_score:
-            best_score = score
-            best = (page_id, notion_name, props)
-
-    if not best:
-        return None, None, {}
-
-    # For weak matches (score=1), only accept if in KNOWN_MATCHES allowlist
-    if best_score == 1:
-        _, notion_name, _ = best
-        print(f"  WEAK MATCH (score=1): last name matched but first name didn't — '{notion_name}'")
-
-        if len(candidates) > 1:
-            names = [n for _, n, _ in candidates]
-            print(f"  AMBIGUOUS: multiple weak matches found: {names} — skipping")
-            return "AMBIGUOUS", None, {}
-
-        # Only accept weak match if it's a known-good pairing (spouse, nickname)
-        # The KNOWN_MATCHES check happens in the main loop — return it and let
-        # the caller decide whether to accept or reject
-        # (This is safe because unknown weak matches get flagged as MATCH WARNING)
-
-    page_id, notion_name, props = best
-    current = _extract_current_values(props)
-    return page_id, notion_name, current
+    return None, None, {}
 
 
 def create_notion_client(record):
@@ -577,6 +541,8 @@ def create_notion_client(record):
         properties["Relational Preference"] = {"select": {"name": record["relational"]}}
     if record["autonomy"]:
         properties["Decision Autonomy"] = {"select": {"name": record["autonomy"]}}
+    if record.get("comm_preference"):
+        properties["Communication Preference"] = {"select": {"name": record["comm_preference"]}}
 
     # Profile fields
     for internal_key, notion_prop in PROFILE_NOTION_PROPERTIES.items():
@@ -635,6 +601,10 @@ def update_notion(page_id, record, current_values):
         properties["Relational Preference"] = {"select": {"name": record["relational"]}}
     if record["autonomy"]:
         properties["Decision Autonomy"] = {"select": {"name": record["autonomy"]}}
+
+    # Communication Preference — always overwrite (latest preference wins)
+    if record.get("comm_preference"):
+        properties["Communication Preference"] = {"select": {"name": record["comm_preference"]}}
 
     # Profile fields — only fill if currently empty (preserves manual edits)
     for internal_key, notion_prop in PROFILE_NOTION_PROPERTIES.items():
@@ -751,11 +721,19 @@ def parse_response(item):
     aut_label = answer_map.get(FIELD_AUTONOMY, {}).get("choice", {}).get("label", "")
     autonomy = map_select(aut_label, AUTONOMY_MAP)
 
+    # Extract communication preference (SMS or Email)
+    comm_preference = None
+    if FIELD_COMM_PREFERENCE:
+        comm_label = answer_map.get(FIELD_COMM_PREFERENCE, {}).get("choice", {}).get("label", "")
+        comm_preference = map_select(comm_label, COMM_PREFERENCE_MAP)
+
     # Build structured profile fields from remaining answers
     known_ids = set(CAPABILITY_FIELDS.keys()) | {
         FIELD_FIRST_NAME, FIELD_LAST_NAME, FIELD_EMAIL,
         FIELD_RELATIONAL, FIELD_AUTONOMY,
     } | set(CONTACT_FIELDS.values())
+    if FIELD_COMM_PREFERENCE:
+        known_ids.add(FIELD_COMM_PREFERENCE)
 
     profile_data = {}  # internal_key -> list of (sub_label, value)
 
@@ -815,6 +793,7 @@ def parse_response(item):
         "capabilities": cap_string,
         "relational": relational,
         "autonomy": autonomy,
+        "comm_preference": comm_preference,
         "profile_fields": profile_fields,
         "submitted": submitted[:10] if submitted else "",
         "response_id": response_id,
@@ -874,6 +853,7 @@ def verify_data():
         ("Capability Requirements", "rich_text"),
         ("Relational Preference", "select"),
         ("Decision Autonomy", "select"),
+        ("Communication Preference", "select"),
     ]
 
     profile_fields = [(prop, "rich_text") for prop in PROFILE_NOTION_PROPERTIES.values()]
@@ -1129,7 +1109,7 @@ def main():
             print(f"  Caps: {r['capabilities'][:70]}...")
         else:
             print(f"  Caps: (none)")
-        print(f"  Rel: {r['relational']} | Aut: {r['autonomy']}")
+        print(f"  Rel: {r['relational']} | Aut: {r['autonomy']} | Comm: {r.get('comm_preference', '(none)')}")
 
         # Show contact info in logs (redacted — full PII stays out of CI logs)
         contact_parts = []
@@ -1151,19 +1131,13 @@ def main():
             filled = [PROFILE_NOTION_PROPERTIES.get(k, k) for k in pf if pf[k]]
             print(f"  Profile: {len(filled)} fields ({', '.join(filled[:4])}{'...' if len(filled) > 4 else ''})")
 
-        page_id, notion_name, current = find_notion_client(r["last"], r["first"])
+        page_id, notion_name, current = find_notion_client(r["email"], r["last"], r["first"])
         time.sleep(0.35)
 
-        if page_id == "AMBIGUOUS":
-            print(f"  SKIPPED: ambiguous match — needs manual review")
-            skipped += 1
-            print()
-            continue
-
         if not page_id:
-            # Auto-create new client row if response is completed and has email
-            if r["completed"] and r["email"]:
-                print(f"  NOT FOUND — creating new client row...")
+            # No match — create new client row
+            if r["completed"]:
+                print(f"  NEW CLIENT — creating Notion row...")
                 try:
                     new_id = create_notion_client(r)
                     if new_id:
@@ -1176,24 +1150,10 @@ def main():
                     print(f"  CREATE ERROR: {e}")
                     not_found += 1
             else:
-                reason = "partial response" if not r["completed"] else "no email"
-                print(f"  NOT FOUND in Notion (skipping auto-create: {reason})")
+                print(f"  NOT FOUND (skipping create: partial response)")
                 not_found += 1
             print()
             continue
-
-        # Match quality check: reject if names don't overlap UNLESS it's a known pair
-        tf_name = r["name"].lower().strip()
-        notion_lower = notion_name.lower().strip()
-        name_ok = (r["first"].lower() in notion_lower and r["last"].lower() in notion_lower)
-        if not name_ok:
-            if (tf_name, notion_lower) in KNOWN_MATCHES:
-                print(f"  Known match: '{r['name']}' -> '{notion_name}'")
-            else:
-                print(f"  REJECTED: '{r['name']}' matched to '{notion_name}' — not in KNOWN_MATCHES")
-                not_found += 1
-                print()
-                continue
 
         print(f"  -> Notion: {notion_name}")
 
@@ -1228,18 +1188,17 @@ def preflight():
     print("=== PREFLIGHT CHECK ===\n")
     failures = []
 
-    # Test 1: Name scoring logic (no API calls needed)
-    print("[1] Testing name scoring logic...")
+    # Test 1: Name matching logic (email-first, name fallback)
+    print("[1] Testing name matching logic...")
     test_cases = [
-        # (first, last, notion_name, expected_min_score, description)
-        ("Scott", "Edwards", "Scott Edwards", 3, "exact match both names"),
-        ("Scott", "Edwards", "Scott Smith & Mark", 0, "first-only match must reject"),
-        ("Kendall", "Guinn", "Kendal Guinn", 1, "weak match — typo in first name"),
-        ("Dan", "Ferrari", "Daniel Ferrari", 1, "weak match — nickname"),
-        ("Linda", "Salomon", "Bruce Salomon", 1, "weak match — spouse"),
-        ("John", "Smith", "Jane Smith", 1, "weak match — different first name"),
-        ("Alice", "Johnson", "Bob Williams", 0, "no match at all"),
-        ("", "Ferrari", "Daniel Ferrari", 2, "last-only when no first provided"),
+        # (first, last, notion_name, should_match, description)
+        ("Scott", "Edwards", "Scott Edwards", True, "both names match — accept"),
+        ("Scott", "Edwards", "Scott Smith & Mark", False, "first-only match — reject"),
+        ("Kendall", "Guinn", "Kendal Guinn", False, "first name typo — reject (different person)"),
+        ("Dan", "Ferrari", "Daniel Ferrari", False, "nickname mismatch — reject (create new)"),
+        ("Linda", "Salomon", "Bruce Salomon", False, "spouse — reject (create new)"),
+        ("Alice", "Johnson", "Bob Williams", False, "no match — reject"),
+        ("Scott", "Edwards", "scott edwards", True, "case insensitive — accept"),
     ]
 
     for first, last, notion_name, expected, desc in test_cases:
@@ -1248,21 +1207,12 @@ def preflight():
             r'\b' + re.escape(first.lower()) + r'\b', notion_lower))
         has_last = bool(last and re.search(
             r'\b' + re.escape(last.lower()) + r'\b', notion_lower))
+        matched = has_first and has_last
 
-        score = 0
-        if has_first and has_last:
-            score = 3
-        elif has_last and not first:
-            score = 2
-        elif has_last:
-            score = 1
-        elif has_first and not last:
-            score = 1
-
-        status = "PASS" if score == expected else "FAIL"
+        status = "PASS" if matched == expected else "FAIL"
         if status == "FAIL":
-            failures.append(f"Score test: '{first} {last}' vs '{notion_name}' — got {score}, expected {expected} ({desc})")
-        print(f"  {status}: {desc} — score={score} (expected {expected})")
+            failures.append(f"Match test: '{first} {last}' vs '{notion_name}' — got {matched}, expected {expected} ({desc})")
+        print(f"  {status}: {desc}")
 
     # Test 2: PII redaction
     print("\n[2] Testing PII redaction...")
@@ -1283,35 +1233,15 @@ def preflight():
     else:
         print(f"  PASS: phone redacted to {redacted_phone}")
 
-    # Test 3: KNOWN_MATCHES contains valid pairs
-    print("\n[3] Checking KNOWN_MATCHES allowlist...")
-    for tf_name, notion_name in KNOWN_MATCHES:
-        if tf_name != tf_name.lower() or notion_name != notion_name.lower():
-            failures.append(f"KNOWN_MATCHES: ({tf_name}, {notion_name}) not lowercased")
-            print(f"  FAIL: ({tf_name}, {notion_name}) must be lowercase")
-    print(f"  {len(KNOWN_MATCHES)} pairs registered, all lowercase: {'PASS' if not any('KNOWN_MATCHES' in f for f in failures) else 'FAIL'}")
-
-    # Test 4: SKIP_NAMES are lowercase
-    print("\n[4] Checking SKIP_NAMES...")
+    # Test 3: SKIP_NAMES are lowercase
+    print("\n[3] Checking SKIP_NAMES...")
     for name in SKIP_NAMES:
         if name != name.lower():
             failures.append(f"SKIP_NAMES: '{name}' not lowercased")
     print(f"  {len(SKIP_NAMES)} entries, all lowercase: PASS")
 
-    # Test 5: AMBIGUOUS sentinel handling
-    print("\n[5] Testing AMBIGUOUS sentinel...")
-    if "AMBIGUOUS" != "AMBIGUOUS":
-        failures.append("Sentinel test failed")
-    # Verify the sentinel is a string that won't be falsy
-    sentinel = "AMBIGUOUS"
-    if not sentinel:  # Must be truthy to prevent auto-create
-        failures.append("AMBIGUOUS sentinel is falsy — auto-create would fire")
-        print("  FAIL: sentinel is falsy")
-    else:
-        print("  PASS: AMBIGUOUS sentinel is truthy (won't trigger auto-create)")
-
-    # Test 6: Dedup key uniqueness
-    print("\n[6] Testing dedup key logic...")
+    # Test 4: Dedup key uniqueness
+    print("\n[4] Testing dedup key logic...")
     # Two records with same name but different response_ids should NOT collapse
     r1 = {"email": "", "name": "John Smith", "response_id": "abc123"}
     r2 = {"email": "", "name": "John Smith", "response_id": "def456"}
@@ -1334,8 +1264,8 @@ def preflight():
     else:
         print(f"  PASS: same email deduplicates correctly")
 
-    # Test 7: Profile routing coverage
-    print("\n[7] Testing profile routing coverage...")
+    # Test 5: Profile routing coverage
+    print("\n[5] Testing profile routing coverage...")
     critical_keywords = ["household members", "pets", "pain points", "when would you ideally want", "typical weekday"]
     missing_routes = []
     for kw in critical_keywords:
