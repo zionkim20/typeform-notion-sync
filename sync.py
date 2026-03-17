@@ -255,27 +255,43 @@ def fetch_form_definition():
 
 
 def fetch_typeform_responses():
-    """Fetch all V2 typeform responses via API (both completed and partial)."""
+    """Fetch all V2 typeform responses via API (both completed and partial).
+    Handles pagination — Typeform returns max 1000 per page, we use 100."""
     all_responses = []
 
     for completed_flag in ["true", "false"]:
-        url = f"https://api.typeform.com/forms/{TYPEFORM_FORM_ID}/responses?page_size=100&completed={completed_flag}"
-        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TYPEFORM_TOKEN}"})
-        try:
-            resp = urllib.request.urlopen(req)
-        except urllib.error.HTTPError as e:
-            print(f"ERROR: Typeform API returned {e.code} for completed={completed_flag}")
-            if e.code == 403:
-                print("  Token may be expired or revoked. Regenerate at:")
-                print("  https://admin.typeform.com/user/tokens")
-                print("  Then update TYPEFORM_TOKEN in GitHub Secrets.")
-            raise
-        data = json.loads(resp.read().decode())
+        after_token = None
+        page = 0
+        while True:
+            url = f"https://api.typeform.com/forms/{TYPEFORM_FORM_ID}/responses?page_size=100&completed={completed_flag}"
+            if after_token:
+                url += f"&after={after_token}"
+            req = urllib.request.Request(url, headers={"Authorization": f"Bearer {TYPEFORM_TOKEN}"})
+            try:
+                resp = urllib.request.urlopen(req)
+            except urllib.error.HTTPError as e:
+                print(f"ERROR: Typeform API returned {e.code} for completed={completed_flag}")
+                if e.code == 403:
+                    print("  Token may be expired or revoked. Regenerate at:")
+                    print("  https://admin.typeform.com/user/tokens")
+                    print("  Then update TYPEFORM_TOKEN in GitHub Secrets.")
+                raise
+            data = json.loads(resp.read().decode())
 
-        items = data.get("items", [])
-        for item in items:
-            item["_completed"] = (completed_flag == "true")
-        all_responses.extend(items)
+            items = data.get("items", [])
+            for item in items:
+                item["_completed"] = (completed_flag == "true")
+            all_responses.extend(items)
+            page += 1
+
+            # Typeform pagination: if we got a full page, there may be more
+            if len(items) == 100:
+                after_token = items[-1].get("token")
+                if not after_token:
+                    break
+                time.sleep(0.35)
+            else:
+                break
         time.sleep(0.35)
 
     count = len(all_responses)

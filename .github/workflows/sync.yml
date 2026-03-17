@@ -3,7 +3,7 @@ name: Typeform → Notion Sync
 on:
   schedule:
     # Every 6 hours
-    - cron: '0 */6 * * *'
+    - cron: '0 */2 * * *'
   workflow_dispatch:
     inputs:
       mode:
