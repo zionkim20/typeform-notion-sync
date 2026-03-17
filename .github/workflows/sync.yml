@@ -2,7 +2,7 @@ name: Typeform → Notion Sync
 
 on:
   schedule:
-    # Every 6 hours
+    # Every 2 hours
     - cron: '0 */2 * * *'
   workflow_dispatch:
     inputs:
@@ -78,6 +78,11 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL: ${{ secrets.SLACK_ZION_DM_CHANNEL }}
         run: |
+          # Guard: skip if sync_output.txt doesn't exist (e.g. verify-only runs)
+          if [ ! -f sync_output.txt ]; then
+            echo "No sync_output.txt — skipping Slack notification"
+            exit 0
+          fi
           # Only notify if there were updates, creations, or issues
           if grep -qE "(UPDATED|CREATED|NOT FOUND|AMBIGUOUS)" sync_output.txt 2>/dev/null; then
             UPDATED=$(grep -c "UPDATED" sync_output.txt 2>/dev/null || true)

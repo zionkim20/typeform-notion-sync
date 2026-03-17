@@ -256,12 +256,18 @@ def fetch_form_definition():
 
 def fetch_typeform_responses():
     """Fetch all V2 typeform responses via API (both completed and partial).
-    Handles pagination — Typeform returns max 1000 per page, we use 100."""
+    Handles pagination — Typeform returns max 1000 per page, we use 100.
+    Uses total_items from API response to know when all pages are fetched
+    (short pages mid-stream don't mean we're done)."""
     all_responses = []
 
     for completed_flag in ["true", "false"]:
         after_token = None
         page = 0
+        total_items = None
+        fetched_count = 0
+        retries = 0
+        max_retries = 3
         while True:
             url = f"https://api.typeform.com/forms/{TYPEFORM_FORM_ID}/responses?page_size=100&completed={completed_flag}"
             if after_token:
@@ -270,6 +276,12 @@ def fetch_typeform_responses():
             try:
                 resp = urllib.request.urlopen(req)
             except urllib.error.HTTPError as e:
+                if e.code == 429 and retries < max_retries:
+                    retries += 1
+                    wait = 10 * retries  # exponential-ish: 10s, 20s, 30s
+                    print(f"  Rate limited (429) — retry {retries}/{max_retries}, waiting {wait}s...")
+                    time.sleep(wait)
+                    continue
                 print(f"ERROR: Typeform API returned {e.code} for completed={completed_flag}")
                 if e.code == 403:
                     print("  Token may be expired or revoked. Regenerate at:")
@@ -278,20 +290,26 @@ def fetch_typeform_responses():
                 raise
             data = json.loads(resp.read().decode())
 
+            # Typeform returns total_items on every page — use it to know when done
+            if total_items is None:
+                total_items = data.get("total_items", 0)
+
             items = data.get("items", [])
             for item in items:
                 item["_completed"] = (completed_flag == "true")
             all_responses.extend(items)
+            fetched_count += len(items)
             page += 1
 
-            # Typeform pagination: if we got a full page, there may be more
-            if len(items) == 100:
-                after_token = items[-1].get("token")
-                if not after_token:
-                    break
-                time.sleep(0.35)
-            else:
+            # Stop when we've fetched all items or got an empty page
+            if fetched_count >= total_items or len(items) == 0:
                 break
+
+            # Get pagination token from last item
+            after_token = items[-1].get("token")
+            if not after_token:
+                break
+            time.sleep(0.35)
         time.sleep(0.35)
 
     count = len(all_responses)
@@ -309,9 +327,9 @@ def discover_contact_fields(responses):
         FIELD_RELATIONAL, FIELD_AUTONOMY,
     }
 
-    # Collect unknown fields across first 10 responses for reliable discovery
+    # Collect unknown fields across first 50 responses for reliable discovery
     unknown_fields = {}
-    for item in responses[:10]:
+    for item in responses[:50]:
         for answer in item.get("answers", []):
             fid = answer.get("field", {}).get("id", "")
             ftype = answer.get("field", {}).get("type", "")
@@ -435,6 +453,11 @@ def _extract_current_values(props):
         "state": (props.get("State", {}).get("select") or {}).get("name", ""),
     }
 
+    # Read Typeform Status so we can prevent downgrading Complete -> Partial
+    current["typeform_status"] = (
+        props.get("Typeform Status", {}).get("select") or {}
+    ).get("name", "")
+
     # Read all profile properties
     for internal_key, notion_prop in PROFILE_NOTION_PROPERTIES.items():
         rt = props.get(notion_prop, {}).get("rich_text", [])
@@ -502,7 +525,7 @@ def find_notion_client(email, last_name, first_name, address=""):
     if last_name:
         results = _query_notion({
             "filter": {"property": "Task name", "title": {"contains": last_name}},
-            "page_size": 5,
+            "page_size": 20,
         })
         time.sleep(0.35)
 
@@ -543,7 +566,9 @@ def find_notion_client(email, last_name, first_name, address=""):
 def _addresses_match(addr1, addr2):
     """Check if two addresses refer to the same location.
     Compares the street number + first word of street name to handle
-    minor formatting differences (Dr vs Drive, St vs Street, etc.)."""
+    minor formatting differences (Dr vs Drive, St vs Street, etc.).
+    Also checks that unit/apt numbers match (or both are absent) to
+    prevent matching different families in multi-unit buildings."""
     # Extract street number from each
     num1 = re.match(r'(\d+)', addr1)
     num2 = re.match(r'(\d+)', addr2)
@@ -561,7 +586,25 @@ def _addresses_match(addr1, addr2):
     if not words1 or not words2:
         return False
 
-    return words1[0] == words2[0]
+    if words1[0] != words2[0]:
+        return False
+
+    # Check unit/apt numbers match (prevent multi-unit building false positives)
+    unit1 = _extract_unit(addr1)
+    unit2 = _extract_unit(addr2)
+    return unit1 == unit2
+
+
+def _extract_unit(address):
+    """Extract apartment/unit number from address, or empty string if none."""
+    # Match patterns like "Apt 4B", "Unit 12", "#3", "Suite 200"
+    match = re.search(
+        r'(?:apt|apartment|unit|suite|ste|#)\s*\.?\s*(\w+)',
+        address, re.IGNORECASE
+    )
+    if match:
+        return match.group(1).lower()
+    return ""
 
 
 def create_notion_client(record):
@@ -693,9 +736,12 @@ def update_notion(page_id, record, current_values):
     if record.get("_partner_email"):
         properties["Partner email"] = {"email": record["_partner_email"]}
 
-    # Always write Typeform Status so team knows full vs partial
+    # Write Typeform Status — but never downgrade from "Complete" to "Partial"
+    # (a spouse's partial submission shouldn't overwrite the primary's complete status)
     status = "Complete" if record["completed"] else "Partial"
-    properties["Typeform Status"] = {"select": {"name": status}}
+    current_status = current_values.get("typeform_status", "")
+    if not (status == "Partial" and current_status == "Complete"):
+        properties["Typeform Status"] = {"select": {"name": status}}
 
     if len(properties) <= 1:
         # Only has status, no actual data — skip
@@ -715,8 +761,8 @@ def update_notion(page_id, record, current_values):
         }
     )
 
-    resp = urllib.request.urlopen(req)
-    return resp.status == 200, written_fields
+    urllib.request.urlopen(req)
+    return True, written_fields
 
 
 # ============================================================================
@@ -1127,8 +1173,9 @@ def main():
     try:
         ensure_profile_properties()
     except Exception as e:
-        print(f"  WARNING: Could not check/create properties: {e}")
-        print("  Profile data may fail to write if properties don't exist")
+        print(f"  ERROR: Could not check/create properties: {e}")
+        print("  Cannot proceed — profile writes will fail without properties.")
+        sys.exit(1)
     print()
 
     # Step 1: Fetch all typeform responses
@@ -1150,9 +1197,15 @@ def main():
             skipped_no_data += 1
 
     # Deduplicate: prefer completed over partial, then latest submission
+    # For records without email, use normalized name to collapse duplicates
+    # (response_id alone would never dedup, defeating the purpose)
     by_key = {}
     for r in parsed:
-        key = r["email"] or f"{r['name']}|{r['response_id']}"
+        if r["email"]:
+            key = r["email"]
+        else:
+            normalized = re.sub(r'\s+', ' ', r['name'].lower().strip())
+            key = f"nomail|{normalized}"
         existing = by_key.get(key)
         if not existing:
             by_key[key] = r
@@ -1183,7 +1236,10 @@ def main():
             continue
 
         status_tag = "COMPLETE" if r["completed"] else "PARTIAL"
-        print(f"-- {r['name']} ({r['submitted']}) [{status_tag}] --")
+        # Redact name in logs: show first initial + last name initial only
+        name_parts = r['name'].split()
+        redacted_name = f"{name_parts[0][0]}. {name_parts[-1][0]}." if len(name_parts) >= 2 else f"{r['name'][0]}."
+        print(f"-- {redacted_name} ({r['submitted']}) [{status_tag}] --")
         if r["capabilities"]:
             print(f"  Caps: {r['capabilities'][:70]}...")
         else:
@@ -1333,22 +1389,22 @@ def preflight():
 
     # Test 4: Dedup key uniqueness
     print("\n[4] Testing dedup key logic...")
-    # Two records with same name but different response_ids should NOT collapse
+    # Two records with same name but no email SHOULD collapse (same person submitting twice)
     r1 = {"email": "", "name": "John Smith", "response_id": "abc123"}
     r2 = {"email": "", "name": "John Smith", "response_id": "def456"}
-    key1 = r1["email"] or f"{r1['name']}|{r1['response_id']}"
-    key2 = r2["email"] or f"{r2['name']}|{r2['response_id']}"
-    if key1 == key2:
-        failures.append("Dedup: same-name records without email still collapse")
-        print("  FAIL: same-name records collapse")
+    key1 = r1["email"] if r1["email"] else f"nomail|{r1['name'].lower().strip()}"
+    key2 = r2["email"] if r2["email"] else f"nomail|{r2['name'].lower().strip()}"
+    if key1 != key2:
+        failures.append("Dedup: same-name records without email should collapse but don't")
+        print("  FAIL: same-name no-email records don't collapse")
     else:
-        print(f"  PASS: keys differ — '{key1}' vs '{key2}'")
+        print(f"  PASS: same-name no-email records collapse correctly")
 
     # Two records with same email should collapse (intended)
     r3 = {"email": "john@example.com", "name": "John Smith", "response_id": "abc"}
     r4 = {"email": "john@example.com", "name": "John A Smith", "response_id": "def"}
-    key3 = r3["email"] or f"{r3['name']}|{r3['response_id']}"
-    key4 = r4["email"] or f"{r4['name']}|{r4['response_id']}"
+    key3 = r3["email"] if r3["email"] else f"nomail|{r3['name'].lower().strip()}"
+    key4 = r4["email"] if r4["email"] else f"nomail|{r4['name'].lower().strip()}"
     if key3 != key4:
         failures.append("Dedup: same-email records should collapse but don't")
         print("  FAIL: same-email records don't collapse")
@@ -1364,6 +1420,10 @@ def preflight():
         ("1509 Wilson Heights Drive", "", False, "empty existing address"),
         ("", "1509 Wilson Heights Drive", False, "empty new address"),
         ("31 KITCHELL RD", "31 kitchell rd", True, "case insensitive"),
+        ("500 Main St Apt 4B", "500 Main St Apt 4B", True, "same unit number"),
+        ("500 Main St Apt 4B", "500 Main St Apt 7C", False, "different unit — multi-unit building"),
+        ("500 Main St Apt 4B", "500 Main St", False, "one has unit, other doesn't"),
+        ("500 Main St", "500 Main St", True, "no units on either side"),
     ]
     for addr1, addr2, expected, desc in addr_tests:
         result = _addresses_match(addr1.lower(), addr2.lower()) if addr1 and addr2 else False
