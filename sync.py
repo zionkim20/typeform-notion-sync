@@ -458,6 +458,11 @@ def _extract_current_values(props):
         props.get("Typeform Status", {}).get("select") or {}
     ).get("name", "")
 
+    # Read Hiring Stage so we can set it to Kickoff if empty
+    current["hiring_stage"] = (
+        props.get("Hiring Stage", {}).get("select") or {}
+    ).get("name", "")
+
     # Read all profile properties
     for internal_key, notion_prop in PROFILE_NOTION_PROPERTIES.items():
         rt = props.get(notion_prop, {}).get("rich_text", [])
@@ -617,6 +622,8 @@ def create_notion_client(record):
     properties = {
         "Task name": {"title": [{"text": {"content": name}}]},
         "Typeform Status": {"select": {"name": "Complete" if record["completed"] else "Partial"}},
+        "Hiring Stage": {"select": {"name": "0.1 - Kickoff"}},
+        "Delivery Phase": {"select": {"name": "Phase 0 \u2014 Hiring in Progress"}},
     }
 
     # Contact info
@@ -731,6 +738,12 @@ def update_notion(page_id, record, current_values):
             properties[notion_prop] = {
                 "rich_text": [{"text": {"content": value[:2000]}}]
             }
+
+    # Hiring Stage & Delivery Phase — set to Kickoff if currently empty
+    # (don't overwrite if client has already progressed past kickoff)
+    if not current_values.get("hiring_stage"):
+        properties["Hiring Stage"] = {"select": {"name": "0.1 - Kickoff"}}
+        properties["Delivery Phase"] = {"select": {"name": "Phase 0 \u2014 Hiring in Progress"}}
 
     # Partner email — set if this is a spouse submission
     if record.get("_partner_email"):
