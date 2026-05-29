@@ -565,6 +565,24 @@ def find_notion_client(email, last_name, first_name, address=""):
                 print(f"  SPOUSE MATCH: same last name + same address as '{notion_name}'")
                 return page_id, notion_name, current, "spouse"
 
+    # Step 4: Partner-email match. Steps 2 & 3 only catch couples who SHARE a
+    # surname. Couples with different last names (e.g. primary "Sophia Merkin",
+    # partner "Philip Fogel") never surface in the last-name search and fall
+    # through to "create new row" — spawning a duplicate household. If the
+    # submitter's email is already recorded as some existing client's partner
+    # email, it's the same household. Near-zero false-positive risk: someone had
+    # to explicitly enter this exact email as their partner's.
+    if email:
+        results = _query_notion({
+            "filter": {"property": "Partner email", "email": {"equals": email}},
+            "page_size": 1,
+        })
+        if results:
+            page_id, notion_name, props = results[0]
+            print(f"  PARTNER-EMAIL MATCH: {email[:3]}***@... already listed as partner of '{notion_name}'")
+            return page_id, notion_name, _extract_current_values(props), "spouse"
+        time.sleep(0.35)
+
     return None, None, {}, None
 
 
